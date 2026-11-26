@@ -8654,6 +8654,25 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[cfg(feature = "diagnostics")]
+struct PresentWhiteSample {
+    frame: u64,
+    primary: ID3D12Resource,
+    composite: Option<ID3D12Resource>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl PresentWhiteSample {
+    fn log(self) {
+        let primary_white = crate::capture::white_pixels(&self.primary);
+        let composite_white = self.composite.as_ref().and_then(crate::capture::white_pixels);
+        tracing::info!(frame = self.frame, ?primary_white, ?composite_white, "present white probe (16 pixels)");
+        if primary_white == Some(16) || composite_white == Some(16) {
+            crate::capture::dump_white_sample();
+        }
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -8664,6 +8683,8 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    #[cfg(feature = "diagnostics")]
+    white_samples: std::collections::VecDeque<(u64, PresentWhiteSample)>,
     hwnd: HWND,
     meter: Meter,
     #[cfg(feature = "diagnostics")]
@@ -9021,6 +9042,15 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        #[cfg(feature = "diagnostics")]
+        {
+            let finished = FINISHED.load(Ordering::Acquire);
+            while p.white_samples.front().is_some_and(|(sent, _)| *sent <= finished) {
+                if let Some((_, sample)) = p.white_samples.pop_front() {
+                    sample.log();
+                }
+            }
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -9094,6 +9124,16 @@ impl Host {
             }
             list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
+            let white_sample = if crate::capture::probe_present_white(frame) && p.white_samples.len() < 8 {
+                crate::capture::probe(&self.device, list, texture).map(|primary| PresentWhiteSample {
+                    frame,
+                    primary,
+                    composite: laid.as_ref().and_then(|target| crate::capture::probe(&self.device, list, target)),
+                })
+            } else {
+                None
+            };
+            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
@@ -9125,6 +9165,14 @@ impl Host {
                     0
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(sample) = white_sample {
+                if flown == 0 {
+                    sample.log();
+                } else {
+                    p.white_samples.push_back((flown, sample));
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
@@ -9192,6 +9240,8 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                #[cfg(feature = "diagnostics")]
+                white_samples: std::collections::VecDeque::new(),
                 hwnd,
                 meter: Meter::new(),
                 #[cfg(feature = "diagnostics")]

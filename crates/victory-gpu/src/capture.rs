@@ -828,6 +828,53 @@ pub(crate) fn probe(
     }
 }
 
+/// Periodically compare the primary plane and the actual presented image.
+pub(crate) fn probe_present_white(frame: u64) -> bool {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    EVERY.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_WHITE_EVERY").ok()?.parse::<u64>().ok().filter(|&n| n != 0)
+    }).is_some_and(|n| frame % n == 0)
+}
+
+/// Request the existing render-target and operation dump while white persists.
+pub(crate) fn dump_white_sample() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if !dump_on() || !crate::switch::on("VICTORY_WHITE_DUMP") {
+        return;
+    }
+    let now = crate::queue::presented();
+    let previous = LAST.load(Relaxed);
+    if previous != 0 && now.saturating_sub(previous) < 200 {
+        return;
+    }
+    if LAST.compare_exchange(previous, now, Relaxed, Relaxed).is_ok() {
+        // Recording can be ahead of the GPU's sampled frame.
+        let frame = now + 3;
+        KEY_FRAME.store(frame, Relaxed);
+        tracing::info!(frame, "white probe: capture the render targets and their operations");
+    }
+}
+
+/// Returns the number of near-white pixels in the tiny sampled grid.
+pub(crate) fn white_pixels(buffer: &ID3D12Resource) -> Option<u32> {
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the caller waits until the copies finished.
+    unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        if data.is_null() {
+            buffer.Unmap(0, None);
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
+        let white = bytes.chunks_exact(SLOT as usize)
+            .filter(|pixel| pixel[..3].iter().all(|&value| value >= 247))
+            .count();
+        buffer.Unmap(0, None);
+        Some(white as u32)
+    }
+}
+
 /// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
