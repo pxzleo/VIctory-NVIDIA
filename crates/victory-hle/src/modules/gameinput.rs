@@ -111,6 +111,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    fn touch(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -430,12 +433,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, touch) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.touch())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, self.one_pad, pads, keys, touch);
         self.deliver(events);
     }
 
@@ -479,22 +484,31 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         one_pad: bool,
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        touch: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads
+                .into_iter()
+                .flatten()
+                .fold(merged(fallback(&keys), touch), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
-        let any_pad = pads.iter().any(Option::is_some);
+        let fallback = match pads.iter_mut().flatten().next() {
+            Some(first) => {
+                *first = merged(*first, touch);
+                None
+            }
+            None => Some(Value::Pad(merged(fallback(&keys), touch))),
+        };
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1235,6 +1249,17 @@ mod host {
                 .collect()
         }
 
+        fn touch(&mut self) -> PadState {
+            let [left_x, left_y, right_x, right_y] = super::super::window_controls::sticks();
+            PadState {
+                left_x,
+                left_y,
+                right_x,
+                right_y,
+                ..PadState::default()
+            }
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1334,6 +1359,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        touch: PadState,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1345,6 +1371,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn touch(&mut self) -> PadState {
+            self.0.lock().unwrap().touch
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1539,6 +1568,44 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn touch_feeds_the_exposed_gamepad_with_or_without_a_physical_pad() {
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            host.lock().unwrap().touch = PadState {
+                left_y: 0.7,
+                right_x: -0.5,
+                ..Default::default()
+            };
+            hub.poll();
+            let reading = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            assert_eq!((pad(reading).left_y, pad(reading).right_x), (0.7, -0.5));
+            release(reading);
+
+            host.lock().unwrap().pads[2] = Some(PadState {
+                buttons: A,
+                left_x: -1.0,
+                ..Default::default()
+            });
+            hub.poll();
+            let index = if one_pad { FALLBACK } else { 2 };
+            let reading = current(hub, GAMEPAD_KIND, index).unwrap();
+            let state = pad(reading);
+            assert_eq!(
+                (state.buttons, state.left_x, state.left_y, state.right_x),
+                (A, -1.0, 0.7, -0.5)
+            );
+            release(reading);
+
+            host.lock().unwrap().touch = PadState::default();
+            hub.poll();
+            let reading = current(hub, GAMEPAD_KIND, index).unwrap();
+            assert_eq!((pad(reading).left_y, pad(reading).right_x), (0.0, 0.0));
+            assert_eq!(pad(reading).buttons, A);
+            release(reading);
+        }
     }
 
     #[test]

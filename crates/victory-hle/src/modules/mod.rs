@@ -23,6 +23,8 @@ pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
+mod window_controls;
+#[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
 pub mod net;

@@ -242,6 +242,19 @@ Series X profile (sharper, much slower); `-Quality` gives fewer stretched bodies
 and less rainbow skin for about 7 fps. The fork's own `scripts\play.ps1` is
 still there for AMD cards.
 
+### Touch and fullscreen
+
+On a Windows touchscreen, drag anywhere in the left half of the game to move.
+The starting point anchors the virtual stick until you lift that finger. Drag
+in the right half to look around. Both fingers work at the same time, and each
+keeps its role when it crosses the middle. Use the keyboard or a controller for
+game buttons and menus.
+
+Press **F11** to switch between a window and borderless fullscreen on the
+current monitor. To start fullscreen, pass `-More @{VICTORY_FULLSCREEN='1'}`
+to `play-nvidia.ps1` or set `VICTORY_FULLSCREEN=1` when launching Victory
+directly. The game keeps its configured render resolution.
+
 ### Picking a resolution
 
 There is one script per console and resolution in `scripts\`. Each one runs

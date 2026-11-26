@@ -246,6 +246,9 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if let Some(result) = super::window_controls::message(hwnd, message, wparam, lparam) {
+        return result;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -528,6 +531,63 @@ mod tests {
             "2147483648x1080",
         ] {
             assert_eq!(parse_window_limit(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn f11_covers_the_monitor_and_restores_the_title_window() {
+        use windows_sys::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        };
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F11;
+
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("Fullscreen test"),
+            wm::WS_OVERLAPPEDWINDOW,
+            50,
+            75,
+            640,
+            480,
+            null,
+            null,
+            null,
+            null,
+        );
+        assert!(!hwnd.is_null());
+        // SAFETY: a Win32 test window created on this thread.
+        unsafe {
+            let bounds = || {
+                let mut rect = RECT::default();
+                assert_ne!(wm::GetWindowRect(hwnd, &mut rect), 0);
+                [rect.left, rect.top, rect.right, rect.bottom]
+            };
+            let initial = bounds();
+            let mut monitor = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let handle = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            assert_ne!(GetMonitorInfoW(handle, &mut monitor), 0);
+            let RECT {
+                left,
+                top,
+                right,
+                bottom,
+            } = monitor.rcMonitor;
+            let press = |repeat| wm::SendMessageW(hwnd, wm::WM_KEYDOWN, VK_F11 as usize, repeat);
+            press(0);
+            assert_eq!(bounds(), [left, top, right, bottom]);
+            let caption = || wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32 & wm::WS_CAPTION;
+            assert_eq!(caption(), 0);
+            press(1 << 30);
+            assert_eq!(bounds(), [left, top, right, bottom]);
+            press(0);
+            assert_eq!(bounds(), initial);
+            assert_ne!(caption(), 0);
+            assert_ne!(wm::DestroyWindow(hwnd), 0);
         }
     }
 
