@@ -2717,8 +2717,8 @@ struct Sent {
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
-    /// Title-memory ranges written when its shader textures are copied back.
-    texture_back_ranges: Vec<(usize, usize)>,
+    /// Title-memory ranges written by deferred texture and buffer read-backs.
+    read_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2736,7 +2736,7 @@ struct Flight {
     back: Vec<Declared>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
-    texture_back_ranges: Vec<(usize, usize)>,
+    read_back_ranges: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -5037,7 +5037,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    ranges.extend(flight.texture_back_ranges.iter().copied());
+                    ranges.extend(flight.read_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -5250,7 +5250,7 @@ impl Host {
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.read_back_ranges.iter().copied()),
             );
             *flying += order.len();
             *target = *submitted;
@@ -5262,7 +5262,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
-                texture_back_ranges: sent.texture_back_ranges,
+                read_back_ranges: sent.read_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5305,7 +5305,7 @@ impl Host {
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.read_back_ranges.iter().copied()),
             );
             *flying += 1;
             *target = *submitted;
@@ -5317,7 +5317,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
-                texture_back_ranges: sent.texture_back_ranges,
+                read_back_ranges: sent.read_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5785,9 +5785,17 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
-            let mut texture_back_ranges = Vec::new();
+            let mut read_back_ranges = Vec::new();
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                let deferred = list.deferred();
+                read_back_ranges.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+                // The linear copies (including the title's small exposure
+                // targets) also land in title memory after the fence. Keep
+                // overlapping CPU reads or upload preparation from seeing
+                // the old contents while these copies are still in flight.
+                read_back_ranges.extend(deferred.backs.iter().map(|(_, at, [row, rows, pitch])| {
+                    (*at, at + pitch * (rows - 1) + row)
+                }));
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -5799,7 +5807,7 @@ impl Host {
                 card,
                 back,
                 own,
-                texture_back_ranges,
+                read_back_ranges,
                 writes,
             };
             working(was_working);
