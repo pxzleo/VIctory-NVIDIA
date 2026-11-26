@@ -250,8 +250,9 @@ in the right half to look around. Hold the right stick away from its starting
 point to keep turning, and return to the center or lift your finger to stop.
 Each touch keeps its role when it crosses the middle.
 You can hold **RT** to accelerate a boat and steer with the left stick
-at the same time. **LT** brakes or reverses. The main layout also has **A** and
-**B**. Tap **…** in the upper-right corner for **X/Y**, **MENU**, the D-pad,
+at the same time. **LT** brakes or reverses. **RT/LT** sit to the left of the
+right stick, and **A/B** to its right. Tap **…** in the upper-right corner for
+**X/Y**, **MENU**, the D-pad,
 **LB/RB**, stick clicks **LS/RS**, **VIEW**, **FS** (fullscreen) and **OFF**
 (quit the game). Tap **…** again to close the menu.
 

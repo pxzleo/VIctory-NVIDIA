@@ -226,15 +226,37 @@ impl MenuArt {
     }
 }
 
+const BUTTON_GAP: i32 = 6;
+
+fn original_button_radius(rect: RECT) -> i32 {
+    (rect.right.min(rect.bottom) / 16).clamp(10, 64)
+}
+
+fn action_radius(rect: RECT) -> i32 {
+    (original_button_radius(rect) * 6 + 2) / 5
+}
+
+fn action_diagonal(stick: i32, button: i32) -> i32 {
+    ((stick + button + BUTTON_GAP) as f32 * std::f32::consts::FRAC_1_SQRT_2).ceil() as i32
+}
+
 fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -> Pose {
     let previous = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
+    let button = action_radius(rect);
+    let diagonal_room = rect.right.min(rect.bottom) / 2 - button - 2;
     let radius = ((previous * 3 + 1) / 2)
         .min(rect.right / 4 - 2)
-        .min(rect.bottom / 2 - 2);
+        .min((rect.right - 4 * button - 16) / 3)
+        .min((diagonal_room as f32 * std::f32::consts::SQRT_2) as i32 - button - BUTTON_GAP);
     let inset = radius + 2;
+    let idle_inset = if index == 1 {
+        button + action_diagonal(radius, button) + 2
+    } else {
+        inset
+    };
     let fallback = POINT {
-        x: rect.right * [18, 82][index] / 100,
-        y: rect.bottom * 73 / 100,
+        x: (rect.right * [18, 82][index] / 100).clamp(idle_inset, rect.right - idle_inset),
+        y: (rect.bottom * 73 / 100).clamp(idle_inset, rect.bottom - idle_inset),
     };
     let (anchor, finger) = drag.unwrap_or((fallback, fallback));
     let feel = super::stick_travel(rect);
@@ -267,45 +289,25 @@ fn menu_pose(rect: RECT, pressed: u32) -> Pose {
 }
 
 fn primary_pose(rect: RECT, action: Action) -> Pose {
-    let side = rect.right.min(rect.bottom);
-    let original_radius = (side / 16).clamp(10, 64);
-    let more = (
-        (rect.right * 92 / 100).clamp(original_radius, rect.right - original_radius),
-        (rect.bottom * 15 / 100).clamp(original_radius, rect.bottom - original_radius),
-    );
     let (center, radius) = if action == Action::More {
-        (more, original_radius)
+        let radius = original_button_radius(rect);
+        let center = (
+            (rect.right * 92 / 100).clamp(radius, rect.right - radius),
+            (rect.bottom * 15 / 100).clamp(radius, rect.bottom - radius),
+        );
+        (center, radius)
     } else {
-        let gap = (side / 100).clamp(2, 8);
         let stick = pose(rect, POINT::default(), 1, None);
-        let mut radius = original_radius * 2;
-        let mut right = (rect.right * 64 / 100).min(stick.center.0 - stick.radius - radius - gap);
-        let mut bottom = (rect.bottom * 87 / 100).min(rect.bottom - radius - gap);
-        if right - 2 * radius - gap < rect.right / 2 - radius / 4 {
-            // On a narrow screen, move the button group above the stick.
-            let stick_top = stick.center.1 - stick.radius;
-            radius = radius
-                .min((stick_top - 3 * gap) / 4)
-                .min((rect.right - 3 * gap) / 4);
-            bottom = stick_top - radius - gap;
-            right = (rect.right * 85 / 100).min(rect.right - radius - gap);
-            let top = bottom - 2 * radius - gap;
-            let clearance = radius + original_radius + gap;
-            let dy = top - more.1;
-            if dy.abs() < clearance {
-                let span = f64::from(clearance * clearance - dy * dy).sqrt().ceil() as i32;
-                right = right.min(more.0 - span);
-            }
-        }
-        let spacing = 2 * radius + gap;
-        let center = match action {
-            Action::Rt => (right, bottom - spacing),
-            Action::Lt => (right, bottom),
-            Action::A => (right - spacing, bottom - spacing),
-            Action::B => (right - spacing, bottom),
+        let radius = action_radius(rect);
+        let offset = action_diagonal(stick.radius, radius);
+        let (x, y) = match action {
+            Action::Rt => (-offset, -offset),
+            Action::Lt => (-offset, offset),
+            Action::A => (offset, -offset),
+            Action::B => (offset, offset),
             _ => unreachable!("secondary button has a menu position"),
         };
-        (center, radius)
+        ((stick.center.0 + x, stick.center.1 + y), radius)
     };
     Pose {
         center,
@@ -725,7 +727,7 @@ mod tests {
         assert!(button_at(rect, x) == Some(Action::X));
         assert!(menu_covers(rect, blank) && button_at(rect, blank).is_none());
         toggle_more();
-        assert_eq!(primary_pose(rect, Action::Rt).radius, 66);
+        assert_eq!(primary_pose(rect, Action::Rt).radius, 40);
         assert!((175..255).contains(&(paint_pixel(pose, 0, 0) >> 24)));
     }
 
@@ -778,12 +780,28 @@ mod tests {
                 let old = (width.min(height) / 16).clamp(10, 64);
                 assert_eq!(
                     pad.radius,
-                    if action == Action::More { old } else { old * 2 }
+                    if action == Action::More {
+                        old
+                    } else {
+                        (old * 6 + 2) / 5
+                    }
                 );
                 assert!((pad.radius..=width - pad.radius).contains(&pad.center.0));
                 assert!((pad.radius..=height - pad.radius).contains(&pad.center.1));
                 let (dx, dy) = (pad.center.0 - stick.center.0, pad.center.1 - stick.center.1);
                 assert!(dx * dx + dy * dy >= (stick.radius + pad.radius).pow(2));
+                if action != Action::More {
+                    assert_eq!(dx.abs(), dy.abs());
+                    assert!(
+                        button_at(
+                            rect,
+                            POINT {
+                                x: pad.center.0,
+                                y: pad.center.1
+                            }
+                        ) == Some(action)
+                    );
+                }
                 for &other in &PRIMARY[..i] {
                     let other = primary_pose(rect, other);
                     let (dx, dy) = (pad.center.0 - other.center.0, pad.center.1 - other.center.1);
