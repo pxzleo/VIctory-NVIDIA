@@ -454,6 +454,48 @@ impl Stage {
     }
 }
 
+/// Tables with constant views that two or more stages would each rebuild.
+/// A common extent lets them reuse the list's existing fresh-table cache.
+fn shared_table_spans(stages: &[Stage]) -> Vec<(u8, u32)> {
+    use victory_shader::{ResourceType, RootType};
+
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if stages.len() < 2
+        || !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_STAGE_SHARE").is_some_and(|v| v == "1"))
+    {
+        return Vec::new();
+    }
+
+    let mut spans = [(0u32, 0u32, false); 256];
+    for stage in stages {
+        let shader = stage.translated();
+        // Keep independently sized tables where a stage selects entries at
+        // run time or interprets the same records with another view format.
+        for view in &shader.host.root_indexed_views {
+            spans[usize::from(view.table_slot)].2 = true;
+        }
+        for &(slot, _) in &shader.host.half_views {
+            spans[usize::from(slot)].2 = true;
+        }
+        let mut stage_slots = [(false, 0u32); 256];
+        for view in shader.used.iter().filter(|view| view.root == RootType::Table) {
+            let (constant, extent) = &mut stage_slots[usize::from(view.slot)];
+            *constant |= view.kind == ResourceType::Cbv;
+            *extent = (*extent).max(view.table_offset_dwords / 8 + 1);
+        }
+        for ((count, max, _), (constant, extent)) in spans.iter_mut().zip(stage_slots) {
+            if constant {
+                *count += 1;
+                *max = (*max).max(extent);
+            }
+        }
+    }
+
+    spans.into_iter().enumerate().filter_map(|(slot, (count, extent, special))| {
+        (count >= 2 && !special).then_some((slot as u8, extent))
+    }).collect()
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -463,6 +505,7 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    pub(crate) shared_table_spans: Vec<(u8, u32)>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -715,6 +758,7 @@ impl HostPipeline {
                 mesh: false,
                 pso,
                 root,
+                shared_table_spans: shared_table_spans(&bound),
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -768,6 +812,7 @@ impl HostPipeline {
                 mesh: true,
                 pso,
                 root,
+                shared_table_spans: shared_table_spans(&bound),
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -884,6 +929,7 @@ impl HostPipeline {
             mesh: false,
             pso,
             root,
+            shared_table_spans: shared_table_spans(&bound),
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),

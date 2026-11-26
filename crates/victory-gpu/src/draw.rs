@@ -1514,6 +1514,7 @@ impl State {
                 &t.used,
                 &t.host.root_indexed_views,
                 &t.host.half_views,
+                &p.shared_table_spans,
                 compute,
             );
             STORES.set(true);
@@ -3191,6 +3192,7 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         half: &[(u8, u32)],
+        shared_spans: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -3308,10 +3310,16 @@ impl State {
                 .max()
                 .unwrap_or(0)
                 + 1;
-            let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
-                || last.and_then(|handle| heap.index(handle)).is_none()
-            {
+            let fits = |span: u32| {
+                span <= crate::descriptor::host::DYNAMIC
+                    && table.checked_add(u64::from(span - 1) * 32)
+                        .and_then(|last| heap.index(last))
+                        .is_some()
+            };
+            let n = shared_spans.iter()
+                .find(|&&(shared_slot, extent)| shared_slot == slot && extent > n && fits(extent))
+                .map_or(n, |&(_, extent)| extent);
+            if !fits(n) {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
