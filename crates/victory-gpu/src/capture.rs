@@ -750,14 +750,26 @@ pub(crate) fn probe(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<ID3D12Resource> {
+    probe_color(device, list, texture, GRID, false)
+}
+
+fn probe_color(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    grid: u32,
+    wide: bool,
+) -> Option<ID3D12Resource> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
+    if !(matches!(d.Format.0, 27..=29 | 87 | 90 | 91)
+        || wide && matches!(d.Format.0, 9 | 10 | 23..=26))
+    {
         return None;
     }
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: SLOT * u64::from(GRID * GRID),
+        Width: SLOT * u64::from(grid * grid),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -786,10 +798,10 @@ pub(crate) fn probe(
             )
             .ok()?;
         let buffer = buffer?;
-        for i in 0..GRID * GRID {
+        for i in 0..grid * grid {
             let (x, y) = (
-                (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
-                (2 * (i / GRID) + 1) * d.Height / (2 * GRID),
+                (2 * (i % grid) + 1) * d.Width as u32 / (2 * grid),
+                (2 * (i / grid) + 1) * d.Height / (2 * grid),
             );
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffer),
@@ -937,4 +949,121 @@ mod tests {
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
+}
+
+/// Opt-in sparse samples around full-screen draw commands, read after the
+/// same submission's fence. Samples contain unnormalized linear/UNORM RGB.
+pub(crate) fn pass_probe_on() -> bool {
+    static START: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    START.get_or_init(|| std::env::var("VICTORY_PASS_PROBE_MS").ok()?.trim().parse().ok())
+        .is_some_and(|start| crate::host::now_ms() >= start)
+}
+
+const PASS_GRID: u32 = 2;
+
+pub(crate) struct PassProbe {
+    resource: usize,
+    width: u64,
+    height: u32,
+    format: i32,
+    shader: String,
+    record_frame: u64,
+    before: Option<ID3D12Resource>,
+    after: Option<ID3D12Resource>,
+}
+
+impl PassProbe {
+    pub(crate) fn begin(
+        list: &crate::host::HostList,
+        targets: &[usize],
+        pipeline: crate::object::This,
+    ) -> Option<Self> {
+        let &[resource] = targets else { return None };
+        let texture = crate::resource::host_resource(resource as crate::object::This)?;
+        // SAFETY: a live target bound by the draw; prepare established its state.
+        let d = unsafe { texture.GetDesc() };
+        if !matches!((d.Width, d.Height), (320, 180) | (640, 360) | (1280, 720) | (1920, 1080))
+            || !matches!(d.Format.0, 9 | 10 | 23..=29 | 87 | 90 | 91)
+            || d.SampleDesc.Count != 1
+            || d.MipLevels != 1
+            || d.DepthOrArraySize != 1
+        {
+            return None;
+        }
+        let shader = crate::pipeline::host_pipeline(pipeline)?.name.clone();
+        let mut out = Self {
+            resource, width: d.Width, height: d.Height, format: d.Format.0,
+            shader, record_frame: crate::queue::presented() + 1, before: None, after: None,
+        };
+        out.before = out.take(list);
+        Some(out)
+    }
+
+    pub(crate) fn finish(mut self, list: &crate::host::HostList) {
+        self.after = self.take(list);
+        if self.before.is_some() || self.after.is_some() {
+            list.defer_pass_probe(self);
+        }
+    }
+
+    fn take(&self, list: &crate::host::HostList) -> Option<ID3D12Resource> {
+        let host = crate::host::host()?;
+        let texture = crate::resource::host_resource(self.resource as crate::object::This)?;
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: an open list and a live, tracked render target. Restore
+        // its original state immediately; this does not change the draw.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+            let buffer = probe_color(&host.device, &list.list, texture, PASS_GRID, true);
+            list.list.ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+            buffer
+        }
+    }
+
+    pub(crate) fn landed(&self, submission: u64, list: usize) {
+        let before = self.before.as_ref().and_then(|b| pass_rgb(b, self.format));
+        let after = self.after.as_ref().and_then(|b| pass_rgb(b, self.format));
+        tracing::info!(
+            submission, list = format_args!("{list:#x}"), record_frame = self.record_frame,
+            target = format_args!("{:#x}", self.resource),
+            width = self.width, height = self.height, format = self.format,
+            shaders = %self.shader, ?before, ?after, "fullscreen pass probe",
+        );
+    }
+}
+
+fn pass_rgb(buffer: &ID3D12Resource, format: i32) -> Option<(f32, u32)> {
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the list's readbacks are processed only after its fence.
+    unsafe { buffer.Map(0, None, Some(&mut data)).ok()? };
+    if data.is_null() {
+        // SAFETY: Map succeeded above.
+        unsafe { buffer.Unmap(0, None) };
+        return None;
+    }
+    let pixels = PASS_GRID * PASS_GRID;
+    let mut total = 0.0;
+    let mut white = 0;
+    for i in 0..pixels {
+        // SAFETY: each sample has its own aligned slot in the buffer.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add((u64::from(i) * SLOT) as usize), 8) };
+        let color = match format {
+            9 | 10 => [0, 2, 4].map(|j| half(u16::from_le_bytes([bytes[j], bytes[j + 1]]))),
+            23..=25 => {
+                let n = u32::from_le_bytes(bytes[..4].try_into().unwrap_or_default());
+                [n & 1023, (n >> 10) & 1023, (n >> 20) & 1023].map(|c| c as f32 / 1023.0)
+            }
+            26 => {
+                let n = u32::from_le_bytes(bytes[..4].try_into().unwrap_or_default());
+                [small_float(n, 6), small_float(n >> 11, 6), small_float(n >> 22, 5)]
+            }
+            _ => [bytes[0], bytes[1], bytes[2]].map(|c| f32::from(c) / 255.0),
+        };
+        total += color.iter().sum::<f32>();
+        white += u32::from(color.iter().all(|&c| c >= 0.9686));
+    }
+    // SAFETY: the buffer is mapped above.
+    unsafe { buffer.Unmap(0, None) };
+    Some((total / (3 * pixels) as f32, white))
 }

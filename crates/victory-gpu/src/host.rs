@@ -2335,6 +2335,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    #[cfg(feature = "diagnostics")]
+    pass_probes: Vec<crate::capture::PassProbe>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -3918,7 +3920,11 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
-fn read_backs(list: &HostList) {
+fn read_backs(list: &HostList, _submission: u64) {
+    #[cfg(feature = "diagnostics")]
+    for probe in &list.deferred().pass_probes {
+        probe.landed(_submission, std::ptr::from_ref(list) as usize);
+    }
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
@@ -4984,7 +4990,7 @@ impl Host {
                 Late::Run(flight) => {
                     last = flight.number;
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        read_backs(flight.lists[i].host(), flight.number);
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5454,7 +5460,7 @@ impl Host {
                     Late::Run(flight) => {
                         last = flight.number;
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            read_backs(flight.lists[i].host(), flight.number);
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -5944,7 +5950,7 @@ impl Host {
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            read_backs(list, this_submission);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -6971,6 +6977,11 @@ impl HostList {
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_pass_probe(&self, probe: crate::capture::PassProbe) {
+        self.deferred().pass_probes.push(probe);
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -9171,6 +9182,11 @@ impl Host {
                     0
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::pass_probe_on() {
+                let submission = if flown == 0 { STARTED.load(Ordering::Acquire) } else { flown };
+                tracing::info!(frame, submission, "fullscreen probe present");
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(sample) = white_sample {
                 if flown == 0 {

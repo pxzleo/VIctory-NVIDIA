@@ -3655,11 +3655,19 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let probe = (matches!(count, 3 | 6) && instances == 1 && crate::capture::pass_probe_on())
+                .then(|| crate::capture::PassProbe::begin(list, &self.targets, self.pipeline as This))
+                .flatten();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(probe) = probe {
+                probe.finish(list);
+            }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
