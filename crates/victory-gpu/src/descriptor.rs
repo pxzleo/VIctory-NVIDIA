@@ -11,6 +11,7 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+mod dynamic;
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
