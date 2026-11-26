@@ -546,13 +546,13 @@ mod tests {
             ..Default::default()
         };
         touch.start(left, POINT { x: 288, y: 657 }, size, now);
-        touch.start(rt, POINT { x: 1024, y: 648 }, size, now);
+        touch.start(rt, POINT { x: 1024, y: 548 }, size, now);
         touch.move_to(left, POINT { x: 410, y: 657 });
         let mask = |state: &Touch| state.button_mask(|held, tap| held.is_some() || tap.is_some());
         assert!(Action::Rt.in_mask(mask(&touch)));
         assert_eq!(touch.sticks(), [1.0, 0.0, 0.0, 0.0]);
         assert!(touch.stop(|contact| contact == rt));
-        touch.start(lt, POINT { x: 1008, y: 783 }, size, now);
+        touch.start(lt, POINT { x: 1024, y: 780 }, size, now);
         assert!(!Action::Rt.in_mask(mask(&touch)));
         assert!(Action::Lt.in_mask(mask(&touch)));
         touch.cancel(|contact| contact.window == 1);

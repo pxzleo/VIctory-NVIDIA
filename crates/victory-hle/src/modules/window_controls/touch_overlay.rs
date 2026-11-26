@@ -267,36 +267,48 @@ fn menu_pose(rect: RECT, pressed: u32) -> Pose {
 }
 
 fn primary_pose(rect: RECT, action: Action) -> Pose {
-    let (x, y) = match action {
-        Action::Lt => (63, 87),
-        Action::Rt => (64, 72),
-        Action::A => (88, 53),
-        Action::B => (74, 53),
-        Action::More => (92, 15),
-        _ => unreachable!("secondary button has a menu position"),
-    };
-    let radius = (rect.right.min(rect.bottom) / 16).clamp(10, 64);
-    let mut center = (rect.right * x / 100, rect.bottom * y / 100);
-    // Keep the idle right stick clear of the action buttons, including in portrait.
-    let stick = pose(rect, POINT::default(), 1, None);
-    let clear = stick.radius + radius + 4;
-    let (dx, dy) = (center.0 - stick.center.0, center.1 - stick.center.1);
-    if dx * dx + dy * dy < clear * clear {
-        match action {
-            Action::Lt | Action::Rt => {
-                center.0 = stick.center.0 - f64::from(clear * clear - dy * dy).sqrt().ceil() as i32;
+    let side = rect.right.min(rect.bottom);
+    let original_radius = (side / 16).clamp(10, 64);
+    let more = (
+        (rect.right * 92 / 100).clamp(original_radius, rect.right - original_radius),
+        (rect.bottom * 15 / 100).clamp(original_radius, rect.bottom - original_radius),
+    );
+    let (center, radius) = if action == Action::More {
+        (more, original_radius)
+    } else {
+        let gap = (side / 100).clamp(2, 8);
+        let stick = pose(rect, POINT::default(), 1, None);
+        let mut radius = original_radius * 2;
+        let mut right = (rect.right * 64 / 100).min(stick.center.0 - stick.radius - radius - gap);
+        let mut bottom = (rect.bottom * 87 / 100).min(rect.bottom - radius - gap);
+        if right - 2 * radius - gap < rect.right / 2 - radius / 4 {
+            // On a narrow screen, move the button group above the stick.
+            let stick_top = stick.center.1 - stick.radius;
+            radius = radius
+                .min((stick_top - 3 * gap) / 4)
+                .min((rect.right - 3 * gap) / 4);
+            bottom = stick_top - radius - gap;
+            right = (rect.right * 85 / 100).min(rect.right - radius - gap);
+            let top = bottom - 2 * radius - gap;
+            let clearance = radius + original_radius + gap;
+            let dy = top - more.1;
+            if dy.abs() < clearance {
+                let span = f64::from(clearance * clearance - dy * dy).sqrt().ceil() as i32;
+                right = right.min(more.0 - span);
             }
-            Action::A | Action::B => {
-                center.1 = stick.center.1 - f64::from(clear * clear - dx * dx).sqrt().ceil() as i32;
-            }
-            _ => {}
         }
-    }
+        let spacing = 2 * radius + gap;
+        let center = match action {
+            Action::Rt => (right, bottom - spacing),
+            Action::Lt => (right, bottom),
+            Action::A => (right - spacing, bottom - spacing),
+            Action::B => (right - spacing, bottom),
+            _ => unreachable!("secondary button has a menu position"),
+        };
+        (center, radius)
+    };
     Pose {
-        center: (
-            center.0.clamp(radius, rect.right - radius),
-            center.1.clamp(radius, rect.bottom - radius),
-        ),
+        center,
         thumb: (0, 0),
         radius,
         active: false,
@@ -713,7 +725,7 @@ mod tests {
         assert!(button_at(rect, x) == Some(Action::X));
         assert!(menu_covers(rect, blank) && button_at(rect, blank).is_none());
         toggle_more();
-        assert!(primary_pose(rect, Action::Rt).radius > (rect.bottom / 31));
+        assert_eq!(primary_pose(rect, Action::Rt).radius, 66);
         assert!((175..255).contains(&(paint_pixel(pose, 0, 0) >> 24)));
     }
 
@@ -747,7 +759,13 @@ mod tests {
 
     #[test]
     fn larger_idle_sticks_fit_in_landscape_and_portrait() {
-        for (width, height, radius) in [(1646, 926, 122), (540, 1118, 72), (390, 844, 72)] {
+        for (width, height, radius) in [
+            (1118, 540, 72),
+            (1646, 926, 122),
+            (540, 1118, 72),
+            (390, 844, 72),
+            (540, 540, 72),
+        ] {
             let rect = RECT {
                 right: width,
                 bottom: height,
@@ -755,10 +773,22 @@ mod tests {
             };
             let stick = pose(rect, POINT::default(), 1, None);
             assert_eq!(stick.radius, radius);
-            for action in PRIMARY {
+            for (i, &action) in PRIMARY.iter().enumerate() {
                 let pad = primary_pose(rect, action);
+                let old = (width.min(height) / 16).clamp(10, 64);
+                assert_eq!(
+                    pad.radius,
+                    if action == Action::More { old } else { old * 2 }
+                );
+                assert!((pad.radius..=width - pad.radius).contains(&pad.center.0));
+                assert!((pad.radius..=height - pad.radius).contains(&pad.center.1));
                 let (dx, dy) = (pad.center.0 - stick.center.0, pad.center.1 - stick.center.1);
                 assert!(dx * dx + dy * dy >= (stick.radius + pad.radius).pow(2));
+                for &other in &PRIMARY[..i] {
+                    let other = primary_pose(rect, other);
+                    let (dx, dy) = (pad.center.0 - other.center.0, pad.center.1 - other.center.1);
+                    assert!(dx * dx + dy * dy >= (pad.radius + other.radius).pow(2));
+                }
             }
         }
 
