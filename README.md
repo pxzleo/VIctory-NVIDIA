@@ -252,9 +252,12 @@ Each touch keeps its role when it crosses the middle.
 You can hold **RT** to accelerate a boat and steer with the left stick
 at the same time. **LT** brakes or reverses. The four buttons curve around the
 right stick from lower left to top in the order **LT**, **RT**, **A**, **B**.
+**LB** is above the left stick. **R** by the right stick clicks the right
+stick (**RS**). If a remote client sends mouse input, you can use its
+left-button drag on a visible stick or tap a visible button.
 Tap **…** in the upper-right corner for
 **X/Y**, **MENU**, the D-pad,
-**LB/RB**, stick clicks **LS/RS**, **VIEW**, **FS** (fullscreen) and **OFF**
+**RB**, **LS**, **VIEW**, **FS** (fullscreen) and **OFF**
 (quit the game). Tap **…** again to close the menu.
 
 The translucent guides rest near the lower corners, then follow each touch's

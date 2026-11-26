@@ -11,10 +11,15 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, ScreenToClient,
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    ScreenToClient,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F11;
-use windows_sys::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_FLAG_CANCELED, POINTER_INFO};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, ReleaseCapture, SetCapture, VK_F11,
+};
+use windows_sys::Win32::UI::Input::Pointer::{
+    GetPointerInfo, POINTER_FLAG_CANCELED, POINTER_FLAG_INCONTACT, POINTER_INFO,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, PT_TOUCH};
 
 #[path = "window_controls/touch_overlay.rs"]
@@ -22,6 +27,8 @@ mod touch_overlay;
 
 const FACE_TAP: Duration = Duration::from_millis(85);
 const START_FULLSCREEN: u32 = wm::WM_APP + 0x4a3;
+const MOUSE_CONTACT: u32 = u32::MAX;
+const MOUSE_LEFT_DOWN: WPARAM = 1; // MK_LBUTTON
 pub(super) fn hook_installed(hwnd: HWND) {
     touch_overlay::start_for_touchscreen(hwnd);
 }
@@ -30,6 +37,12 @@ pub(super) fn hook_installed(hwnd: HWND) {
 struct Contact {
     window: usize,
     id: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Position {
+    client: POINT,
+    screen: POINT,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +110,7 @@ struct Drag {
 
 #[derive(Default)]
 struct Touch {
+    contacts: Vec<Contact>,
     left: Option<Drag>,
     right: Option<Drag>,
     buttons: [Option<Contact>; Action::ALL.len()],
@@ -104,12 +118,12 @@ struct Touch {
 }
 
 impl Touch {
-    fn start(&mut self, contact: Contact, point: POINT, size: RECT, now: Instant) {
-        let side = size.right.min(size.bottom) as f32;
-        if side <= 0.0 {
+    fn start(&mut self, contact: Contact, point: Position, size: RECT, now: Instant) {
+        if self.contacts.contains(&contact) {
             return;
         }
-        if let Some(action) = touch_overlay::button_at(size, point) {
+        self.contacts.push(contact);
+        if let Some(action) = touch_overlay::button_at(size, point.client) {
             let i = action as usize;
             if self.buttons[i].is_none() {
                 self.buttons[i] = Some(contact);
@@ -119,10 +133,29 @@ impl Touch {
             }
             return;
         }
-        if touch_overlay::menu_covers(size, point) {
+        if !touch_overlay::menu_covers(size, point.client) {
+            self.start_drag(contact, point, size);
+        }
+    }
+
+    fn recover_drag(&mut self, contact: Contact, point: Position, size: RECT) {
+        if self.contacts.contains(&contact) {
             return;
         }
-        let slot = if point.x < size.right / 2 {
+        self.contacts.push(contact);
+        // An UPDATE can recover a missed DOWN for a stick, but cannot press a button.
+        if touch_overlay::button_at(size, point.client).is_none()
+            && !touch_overlay::menu_covers(size, point.client)
+        {
+            self.start_drag(contact, point, size);
+        }
+    }
+
+    fn start_drag(&mut self, contact: Contact, point: Position, size: RECT) {
+        if size.right.min(size.bottom) <= 0 {
+            return;
+        }
+        let slot = if point.client.x < size.right / 2 {
             &mut self.left
         } else {
             &mut self.right
@@ -130,8 +163,8 @@ impl Touch {
         if slot.is_none() {
             *slot = Some(Drag {
                 contact,
-                anchor: point,
-                point,
+                anchor: point.screen,
+                point: point.screen,
                 pixels: stick_travel(size),
                 axes: [0.0; 2],
             });
@@ -150,20 +183,19 @@ impl Touch {
     }
 
     fn stop(&mut self, matches: impl Fn(Contact) -> bool) -> bool {
-        let mut stopped = false;
+        let count = self.contacts.len();
+        self.contacts.retain(|&contact| !matches(contact));
         for slot in [&mut self.left, &mut self.right] {
             if slot.as_ref().is_some_and(|drag| matches(drag.contact)) {
                 *slot = None;
-                stopped = true;
             }
         }
         for button in &mut self.buttons {
             if button.is_some_and(&matches) {
                 *button = None;
-                stopped = true;
             }
         }
-        stopped
+        self.contacts.len() != count
     }
 
     fn cancel(&mut self, matches: impl Fn(Contact) -> bool) {
@@ -211,6 +243,7 @@ fn stick(from: POINT, to: POINT, pixels: f32, deadzone: f32) -> [f32; 2] {
 }
 
 static TOUCH: Mutex<Touch> = Mutex::new(Touch {
+    contacts: Vec::new(),
     left: None,
     right: None,
     buttons: [None; Action::ALL.len()],
@@ -281,28 +314,32 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
     let mut info = POINTER_INFO::default();
     // SAFETY: the ID belongs to this pointer message and info is writable.
     if unsafe { GetPointerInfo(contact.id, &mut info) } == 0 {
-        let stopped = TOUCH
-            .lock()
-            .expect("touch state")
-            .stop(|active| active == contact);
-        if stopped {
+        let mut touch = TOUCH.lock().expect("touch state");
+        let known = touch.contacts.contains(&contact);
+        if matches!(message, wm::WM_POINTERUP | wm::WM_POINTERCAPTURECHANGED) {
+            touch.stop(|active| active == contact);
+            drop(touch);
             refresh_pads(hwnd);
         }
-        return stopped.then_some(0);
+        // Missing metadata on an update is transient, not a release.
+        return known.then_some(0);
     }
     if info.pointerType != PT_TOUCH {
         return None;
     }
-    let mut point = info.ptPixelLocation;
+    let screen = info.ptPixelLocation;
     let canceled = info.pointerFlags & POINTER_FLAG_CANCELED != 0;
     match message {
-        _ if canceled => {
+        _ if canceled
+            || (matches!(message, wm::WM_POINTERUPDATE | wm::WM_POINTERLEAVE)
+                && info.pointerFlags & POINTER_FLAG_INCONTACT == 0) =>
+        {
             TOUCH
                 .lock()
                 .expect("touch state")
                 .cancel(|active| active == contact);
         }
-        wm::WM_POINTERUP => release_pointer(hwnd, contact, point),
+        wm::WM_POINTERUP => release_pointer(hwnd, contact, screen),
         wm::WM_POINTERCAPTURECHANGED => {
             TOUCH
                 .lock()
@@ -310,17 +347,26 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
                 .stop(|active| active == contact);
         }
         wm::WM_POINTERDOWN | wm::WM_POINTERUPDATE => {
-            let mut size = RECT::default();
-            // SAFETY: the live window owns this message. The coordinate and rectangle are writable.
-            if unsafe { ScreenToClient(hwnd, &mut point) } != 0
-                && (message == wm::WM_POINTERUPDATE
-                    || unsafe { wm::GetClientRect(hwnd, &mut size) } != 0)
+            let mut touch = TOUCH.lock().expect("touch state");
+            if message == wm::WM_POINTERUPDATE && touch.contacts.contains(&contact) {
+                touch.move_to(contact, screen);
+            } else if message == wm::WM_POINTERDOWN
+                || (info.pointerFlags & POINTER_FLAG_INCONTACT != 0
+                    && unsafe { wm::GetForegroundWindow() } == hwnd)
             {
-                let mut touch = TOUCH.lock().expect("touch state");
-                if message == wm::WM_POINTERDOWN {
-                    touch.start(contact, point, size, Instant::now());
-                } else {
-                    touch.move_to(contact, point);
+                let mut size = RECT::default();
+                let mut client = screen;
+                // SAFETY: the live window owns this message; both outputs are writable.
+                if unsafe {
+                    ScreenToClient(hwnd, &mut client) != 0
+                        && wm::GetClientRect(hwnd, &mut size) != 0
+                } {
+                    let point = Position { client, screen };
+                    if message == wm::WM_POINTERDOWN {
+                        touch.start(contact, point, size, Instant::now());
+                    } else {
+                        touch.recover_drag(contact, point, size);
+                    }
                 }
             }
         }
@@ -328,6 +374,66 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
     }
     refresh_pads(hwnd);
     // Keep touch from also being promoted to gesture or mouse input.
+    Some(0)
+}
+
+/// Some remote clients deliver touch as a left mouse drag. Only take mouse
+/// input that starts on an on-screen control, leaving other mouse clicks alone.
+fn mouse(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    let contact = Contact {
+        window: hwnd as usize,
+        id: MOUSE_CONTACT,
+    };
+    let client = POINT {
+        x: lparam as i16 as i32,
+        y: (lparam >> 16) as i16 as i32,
+    };
+    let mut screen = client;
+    if matches!(message, wm::WM_LBUTTONDOWN | wm::WM_LBUTTONDBLCLK) {
+        let mut size = RECT::default();
+        // SAFETY: the current client point and rectangle have writable storage.
+        if unsafe {
+            wm::GetClientRect(hwnd, &mut size) == 0 || ClientToScreen(hwnd, &mut screen) == 0
+        } || !touch_overlay::mouse_hits_control(hwnd, size, client)
+        {
+            return None;
+        }
+        let mut touch = TOUCH.lock().expect("touch state");
+        if !touch.contacts.is_empty() {
+            return Some(0);
+        }
+        touch.start(contact, Position { client, screen }, size, Instant::now());
+        drop(touch);
+        // SAFETY: take capture after releasing the lock; capture can send messages.
+        unsafe { SetCapture(hwnd) };
+    } else {
+        let mut touch = TOUCH.lock().expect("touch state");
+        if !touch.contacts.contains(&contact) {
+            return None;
+        }
+        if message == wm::WM_MOUSEMOVE && wparam & MOUSE_LEFT_DOWN != 0 {
+            // SAFETY: the current client point has writable storage.
+            if unsafe { ClientToScreen(hwnd, &mut screen) } != 0 {
+                touch.move_to(contact, screen);
+            }
+        } else {
+            drop(touch);
+            // A real mouse UP can also operate the overlay's menu commands.
+            if message == wm::WM_LBUTTONUP && unsafe { ClientToScreen(hwnd, &mut screen) } != 0 {
+                release_pointer(hwnd, contact, screen);
+            } else {
+                TOUCH
+                    .lock()
+                    .expect("touch state")
+                    .cancel(|active| active == contact);
+            }
+            // SAFETY: release only if this window still owns the capture.
+            if unsafe { GetCapture() } == hwnd {
+                unsafe { ReleaseCapture() };
+            }
+        }
+    }
+    refresh_pads(hwnd);
     Some(0)
 }
 
@@ -444,11 +550,28 @@ pub(super) fn message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) 
         | wm::WM_POINTERENTER
         | wm::WM_POINTERLEAVE
         | wm::WM_POINTERCAPTURECHANGED => return pointer(hwnd, message, wparam),
-        wm::WM_KILLFOCUS | wm::WM_CANCELMODE | wm::WM_SIZE | wm::WM_NCDESTROY => {
+        wm::WM_LBUTTONDOWN | wm::WM_LBUTTONDBLCLK | wm::WM_MOUSEMOVE | wm::WM_LBUTTONUP => {
+            return mouse(hwnd, message, wparam, lparam);
+        }
+        wm::WM_CAPTURECHANGED => {
             TOUCH
                 .lock()
                 .expect("touch state")
-                .cancel(|contact| contact.window == hwnd as usize);
+                .stop(|contact| contact.window == hwnd as usize && contact.id == MOUSE_CONTACT);
+            refresh_pads(hwnd);
+        }
+        wm::WM_KILLFOCUS | wm::WM_CANCELMODE | wm::WM_NCDESTROY => {
+            let mut touch = TOUCH.lock().expect("touch state");
+            let mouse = touch.contacts.contains(&Contact {
+                window: hwnd as usize,
+                id: MOUSE_CONTACT,
+            });
+            touch.cancel(|contact| contact.window == hwnd as usize);
+            drop(touch);
+            // SAFETY: this fallback only releases capture it took for this window.
+            if mouse && unsafe { GetCapture() } == hwnd {
+                unsafe { ReleaseCapture() };
+            }
             if message == wm::WM_NCDESTROY {
                 touch_overlay::forget(hwnd);
             } else if message == wm::WM_KILLFOCUS {
@@ -463,9 +586,11 @@ pub(super) fn message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) 
             }
         }
         wm::WM_ACTIVATE if wparam & 0xffff == wm::WA_INACTIVE as usize => touch_overlay::hide(hwnd),
-        wm::WM_ACTIVATE | wm::WM_ACTIVATEAPP | wm::WM_SETFOCUS | wm::WM_WINDOWPOSCHANGED => {
-            refresh_pads(hwnd)
-        }
+        wm::WM_ACTIVATE
+        | wm::WM_ACTIVATEAPP
+        | wm::WM_SETFOCUS
+        | wm::WM_WINDOWPOSCHANGED
+        | wm::WM_SIZE => refresh_pads(hwnd),
         wm::WM_TIMER if wparam == touch_overlay::REFRESH_TIMER => {
             refresh_pads(hwnd);
             return Some(0);
@@ -507,6 +632,18 @@ pub(super) fn message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) 
 mod tests {
     use super::*;
 
+    fn down(touch: &mut Touch, contact: Contact, point: POINT, size: RECT, now: Instant) {
+        touch.start(
+            contact,
+            Position {
+                client: point,
+                screen: point,
+            },
+            size,
+            now,
+        );
+    }
+
     #[test]
     fn simultaneous_contacts_keep_their_roles_and_release_independently() {
         let mut touch = Touch::default();
@@ -520,9 +657,9 @@ mod tests {
             bottom: 800,
             ..Default::default()
         };
-        touch.start(left, POINT { x: 590, y: 400 }, size, now);
-        touch.start(right, POINT { x: 610, y: 400 }, size, now);
-        touch.start(extra, POINT { x: 400, y: 400 }, size, now);
+        down(&mut touch, left, POINT { x: 590, y: 400 }, size, now);
+        down(&mut touch, right, POINT { x: 610, y: 400 }, size, now);
+        down(&mut touch, extra, POINT { x: 400, y: 400 }, size, now);
         touch.move_to(left, POINT { x: 700, y: 400 });
         touch.move_to(right, POINT { x: 500, y: 400 });
         touch.move_to(extra, POINT { x: 500, y: 300 });
@@ -545,14 +682,14 @@ mod tests {
             bottom: 900,
             ..Default::default()
         };
-        touch.start(left, POINT { x: 288, y: 657 }, size, now);
-        touch.start(rt, POINT { x: 1116, y: 657 }, size, now);
+        down(&mut touch, left, POINT { x: 288, y: 657 }, size, now);
+        down(&mut touch, rt, POINT { x: 1116, y: 657 }, size, now);
         touch.move_to(left, POINT { x: 410, y: 657 });
         let mask = |state: &Touch| state.button_mask(|held, tap| held.is_some() || tap.is_some());
         assert!(Action::Rt.in_mask(mask(&touch)));
         assert_eq!(touch.sticks(), [1.0, 0.0, 0.0, 0.0]);
         assert!(touch.stop(|contact| contact == rt));
-        touch.start(lt, POINT { x: 1173, y: 796 }, size, now);
+        down(&mut touch, lt, POINT { x: 1173, y: 796 }, size, now);
         assert!(!Action::Rt.in_mask(mask(&touch)));
         assert!(Action::Lt.in_mask(mask(&touch)));
         touch.cancel(|contact| contact.window == 1);
@@ -570,7 +707,7 @@ mod tests {
             ..Default::default()
         };
         let center = POINT { x: 916, y: 394 };
-        touch.start(contact, center, size, Instant::now());
+        down(&mut touch, contact, center, size, Instant::now());
         for offset in 1..=40 {
             touch.move_to(
                 contact,
@@ -603,6 +740,42 @@ mod tests {
         assert!(touch.sticks()[3] > 0.70);
         assert!(touch.stop(|active| active == contact));
         assert_eq!(touch.sticks(), [0.0; 4]);
+    }
+
+    #[test]
+    fn a_recovered_drag_does_not_fabricate_a_button_press() {
+        let mut touch = Touch::default();
+        let left = Contact { window: 1, id: 1 };
+        let other = Contact { window: 1, id: 2 };
+        let size = RECT {
+            right: 1118,
+            bottom: 540,
+            ..Default::default()
+        };
+        touch.recover_drag(
+            left,
+            Position {
+                client: POINT { x: 201, y: 394 },
+                screen: POINT { x: 301, y: 494 },
+            },
+            size,
+        );
+        touch.move_to(left, POINT { x: 353, y: 494 });
+        assert!(touch.sticks()[0] > 0.95);
+
+        let a = POINT { x: 829, y: 307 };
+        assert!(touch_overlay::button_at(size, a) == Some(Action::A));
+        touch.recover_drag(
+            other,
+            Position {
+                client: a,
+                screen: a,
+            },
+            size,
+        );
+        touch.move_to(other, POINT { x: 916, y: 394 });
+        assert_eq!(touch.sticks()[2], 0.0);
+        assert_eq!(touch.button_mask(|held, _| held.is_some()), 0);
     }
 
     #[test]

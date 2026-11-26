@@ -28,7 +28,15 @@ pub(super) fn toggle_more() {
     MORE.set(!MORE.get());
 }
 
-const PRIMARY: [Action; 5] = [Action::Lt, Action::Rt, Action::A, Action::B, Action::More];
+const PRIMARY: [Action; 7] = [
+    Action::Lt,
+    Action::Rt,
+    Action::A,
+    Action::B,
+    Action::Lb,
+    Action::Rs,
+    Action::More,
+];
 const MENU_ROWS: [[Option<Action>; 4]; 4] = [
     [
         Some(Action::X),
@@ -36,12 +44,7 @@ const MENU_ROWS: [[Option<Action>; 4]; 4] = [
         Some(Action::Menu),
         Some(Action::View),
     ],
-    [
-        Some(Action::Lb),
-        Some(Action::Rb),
-        Some(Action::Ls),
-        Some(Action::Rs),
-    ],
+    [None, Some(Action::Rb), Some(Action::Ls), None],
     [
         Some(Action::Left),
         Some(Action::Up),
@@ -147,6 +150,13 @@ fn update(
     let (sticks, controls) = state.as_mut().unwrap().1.split_at_mut(2);
     let (menu, buttons) = controls.split_last_mut().unwrap();
     for (index, (pad, drag)) in sticks.iter_mut().zip(drags).enumerate() {
+        let drag = drag.map(|(anchor, pointer)| {
+            let to_client = |p: POINT| POINT {
+                x: p.x - origin.x,
+                y: p.y - origin.y,
+            };
+            (to_client(anchor), to_client(pointer))
+        });
         pad.show(pose(rect, origin, index, drag))?;
     }
     for (pad, action) in buttons.iter_mut().zip(PRIMARY) {
@@ -247,8 +257,8 @@ fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -
     let previous = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
     let button = action_radius(rect);
     let gap = action_gap(rect);
-    let vertical_room = rect.bottom - 2 * button - 5;
-    let max_reach = (vertical_room as f32 / (1.0 + std::f32::consts::FRAC_1_SQRT_2)) as i32;
+    let arc_room = rect.right.min(rect.bottom) - 2 * button - 5;
+    let max_reach = (arc_room as f32 / (1.0 + std::f32::consts::FRAC_1_SQRT_2)) as i32;
     let radius = ((previous * 3 + 1) / 2)
         .min((rect.right - 4 * button - 16) / 3)
         .min((rect.right - 2 * button - gap - 8) / 4)
@@ -262,7 +272,9 @@ fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -
         let reach = radius + button + gap;
         let far_edge = button + reach + 2;
         let bottom = rect.bottom - button - action_diagonal(reach) - 2;
-        fallback.x = fallback.x.clamp(far_edge, rect.right - inset);
+        fallback.x = fallback
+            .x
+            .clamp(far_edge, rect.right - button - action_diagonal(reach) - 2);
         fallback.y = fallback.y.clamp(far_edge, bottom);
     }
     let (anchor, finger) = drag.unwrap_or((fallback, fallback));
@@ -304,7 +316,12 @@ fn primary_pose(rect: RECT, action: Action) -> Pose {
         );
         (center, radius)
     } else {
-        let stick = pose(rect, POINT::default(), 1, None);
+        let stick = pose(
+            rect,
+            POINT::default(),
+            usize::from(action != Action::Lb),
+            None,
+        );
         let radius = action_radius(rect);
         let reach = stick.radius + radius + action_gap(rect);
         let offset = action_diagonal(reach);
@@ -313,6 +330,8 @@ fn primary_pose(rect: RECT, action: Action) -> Pose {
             Action::Rt => (-reach, 0),
             Action::A => (-offset, -offset),
             Action::B => (0, -reach),
+            Action::Lb => (0, -reach),
+            Action::Rs => (offset, -offset),
             _ => unreachable!("secondary button has a menu position"),
         };
         ((stick.center.0 + x, stick.center.1 + y), radius)
@@ -347,13 +366,36 @@ pub(super) fn button_at(rect: RECT, point: POINT) -> Option<Action> {
             .item(point.x - pose.center.0, point.y - pose.center.1)
             .map(|(action, _, _)| action);
     }
-    PRIMARY.into_iter().find(|&action| {
-        let pose = primary_pose(rect, action);
-        let (dx, dy) = (point.x - pose.center.0, point.y - pose.center.1);
-        dx.abs() <= pose.radius
-            && dy.abs() <= pose.radius
-            && dx * dx + dy * dy <= pose.radius * pose.radius
-    })
+    PRIMARY
+        .into_iter()
+        .find(|&action| primary_pose(rect, action).contains(point))
+}
+
+pub(super) fn mouse_hits_control(hwnd: HWND, rect: RECT, point: POINT) -> bool {
+    if rect.right.min(rect.bottom) < 112
+        || enabled() == Some(false)
+        || !OVERLAY.with(|state| {
+            state.try_borrow().is_ok_and(|state| {
+                state.as_ref().is_some_and(|(owner, pads)| {
+                    *owner == hwnd && pads.iter().any(|pad| pad.shown.is_some())
+                })
+            })
+        })
+    {
+        return false;
+    }
+    button_at(rect, point).is_some()
+        || menu_covers(rect, point)
+        || (0..2).any(|index| pose(rect, POINT::default(), index, None).contains(point))
+}
+
+impl Pose {
+    fn contains(self, point: POINT) -> bool {
+        let (dx, dy) = (point.x - self.center.0, point.y - self.center.1);
+        dx.abs() <= self.radius
+            && dy.abs() <= self.radius
+            && dx * dx + dy * dy <= self.radius * self.radius
+    }
 }
 
 struct Pad {
@@ -582,7 +624,7 @@ fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
         Action::Lb => b"LB",
         Action::Rb => b"RB",
         Action::Ls => b"LS",
-        Action::Rs => b"RS",
+        Action::Rs => b"R",
         Action::Up => b"^",
         Action::Down => b"v",
         Action::Left => b"<",
@@ -800,7 +842,7 @@ mod tests {
                 assert!((pad.radius..=height - pad.radius).contains(&pad.center.1));
                 let (dx, dy) = (pad.center.0 - stick.center.0, pad.center.1 - stick.center.1);
                 assert!(dx * dx + dy * dy >= (stick.radius + pad.radius).pow(2));
-                if action != Action::More {
+                if action != Action::More && action != Action::Lb {
                     assert!(
                         dx * dx + dy * dy >= (stick.radius + pad.radius + action_gap(rect)).pow(2)
                     );
@@ -809,6 +851,7 @@ mod tests {
                         Action::Rt => (-1, 0),
                         Action::A => (-1, -1),
                         Action::B => (0, -1),
+                        Action::Rs => (1, -1),
                         _ => unreachable!(),
                     };
                     assert_eq!((dx.signum(), dy.signum()), direction);
@@ -820,6 +863,20 @@ mod tests {
                                 y: pad.center.1
                             }
                         ) == Some(action)
+                    );
+                }
+                if action == Action::Lb {
+                    let left = pose(rect, POINT::default(), 0, None);
+                    assert_eq!(pad.center.0, left.center.0);
+                    assert!(left.center.1 - pad.center.1 >= left.radius + pad.radius);
+                    assert!(
+                        button_at(
+                            rect,
+                            POINT {
+                                x: pad.center.0,
+                                y: pad.center.1
+                            }
+                        ) == Some(Action::Lb)
                     );
                 }
                 for &other in &PRIMARY[..i] {
