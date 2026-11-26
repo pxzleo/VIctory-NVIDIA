@@ -341,6 +341,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) -> first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    // Identical records in one title heap may share the list's host table.
+    content_tables: std::collections::HashMap<(u64, u32, u64), ContentTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -386,6 +388,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.content_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -3323,13 +3326,24 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            // Different source addresses can hold the same descriptors.
+            // Keep format overrides on the existing address-keyed path.
+            static CONTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_content = *CONTENT.get_or_init(|| {
+                std::env::var_os("VICTORY_DESCRIPTOR_CONTENT_SHARE").is_some_and(|v| v == "1")
+            }) && !half.iter().any(|&(s, _)| s == slot);
+            let mut records: Few<[u32; 3], 32> = Few::default();
             // The table and what its entries hold (record words).
             let key = {
                 let mut h = RecordHash::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    h.add(words);
+                    if use_content {
+                        records.push(words);
+                    }
                     // (Another table than the same slots made for a shader
                     // that reads them in the title's formats.)
                     if half.contains(&(slot, k * 8)) {
@@ -3338,9 +3352,39 @@ impl State {
                 }
                 (table, n, h.0)
             };
+            let content_key = (heap.start, n, key.2);
+            let alias = if use_content && !self.fresh_tables.contains_key(&key) {
+                self.content_tables.get(&content_key)
+                    .filter(|known| known.records.as_ref() == &records[..])
+                    .map(|known| (known.table, n, key.2))
+            } else {
+                None
+            };
+            let cached_key = alias.unwrap_or(key);
+            let note_alias = || {
+                if alias.is_none() {
+                    return;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DynamicContentAlias, 1);
+                // The cached dynamic descriptors do not replace this
+                // source address in the directly indexed title heap.
+                if let Some(title) = heap.index(table).filter(|first| first + n <= host.count()) {
+                    for k in (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)) {
+                        host.slot_tabled(title + k);
+                    }
+                    for k in entries().map(|u| u.table_offset_dwords / 8).chain(selected.iter().copied()) {
+                        let handle = table + u64::from(k) * 32;
+                        if crate::descriptor::view(handle).is_some_and(|view| crate::descriptor::host::is_texture_view(&view)) {
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, handle);
+                        }
+                    }
+                }
+            };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
-            if let Some(known) = self.fresh_tables.get_mut(&key) {
+            if let Some(known) = self.fresh_tables.get_mut(&cached_key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -3352,6 +3396,7 @@ impl State {
                     if *depth {
                         TESTED_DEPTH.set((reader.3, true));
                     }
+                    note_alias();
                     made.push((slot, first * 32));
                     continue;
                 }
@@ -3363,7 +3408,7 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
+                for &k in &selected {
                     if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
@@ -3376,7 +3421,7 @@ impl State {
                 }
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
-                if once && let Some(known) = self.fresh_tables.get_mut(&key) {
+                if once && let Some(known) = self.fresh_tables.get_mut(&cached_key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
                     let epoch = list.epoch();
@@ -3388,6 +3433,7 @@ impl State {
                         known.ready.push((reader, depth));
                     }
                 }
+                note_alias();
                 made.push((slot, first * 32));
                 continue;
             }
@@ -3398,6 +3444,12 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            if use_content {
+                self.content_tables.entry(content_key).or_insert_with(|| ContentTable {
+                    table,
+                    records: records[..].into(),
+                });
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4190,6 +4242,11 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     fn deref_mut(&mut self) -> &mut [T] {
         if self.many.is_empty() { &mut self.few[..self.len] } else { &mut self.many }
     }
+}
+
+struct ContentTable {
+    table: u64,
+    records: Box<[[u32; 3]]>,
 }
 
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
