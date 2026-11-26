@@ -227,7 +227,10 @@ impl MenuArt {
 }
 
 fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -> Pose {
-    let radius = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
+    let previous = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
+    let radius = ((previous * 3 + 1) / 2)
+        .min(rect.right / 4 - 2)
+        .min(rect.bottom / 2 - 2);
     let inset = radius + 2;
     let fallback = POINT {
         x: rect.right * [18, 82][index] / 100,
@@ -273,10 +276,26 @@ fn primary_pose(rect: RECT, action: Action) -> Pose {
         _ => unreachable!("secondary button has a menu position"),
     };
     let radius = (rect.right.min(rect.bottom) / 16).clamp(10, 64);
+    let mut center = (rect.right * x / 100, rect.bottom * y / 100);
+    // Keep the idle right stick clear of the action buttons, including in portrait.
+    let stick = pose(rect, POINT::default(), 1, None);
+    let clear = stick.radius + radius + 4;
+    let (dx, dy) = (center.0 - stick.center.0, center.1 - stick.center.1);
+    if dx * dx + dy * dy < clear * clear {
+        match action {
+            Action::Lt | Action::Rt => {
+                center.0 = stick.center.0 - f64::from(clear * clear - dy * dy).sqrt().ceil() as i32;
+            }
+            Action::A | Action::B => {
+                center.1 = stick.center.1 - f64::from(clear * clear - dx * dx).sqrt().ceil() as i32;
+            }
+            _ => {}
+        }
+    }
     Pose {
         center: (
-            (rect.right * x / 100).clamp(radius, rect.right - radius),
-            (rect.bottom * y / 100).clamp(radius, rect.bottom - radius),
+            center.0.clamp(radius, rect.right - radius),
+            center.1.clamp(radius, rect.bottom - radius),
         ),
         thumb: (0, 0),
         radius,
@@ -707,7 +726,7 @@ mod tests {
         };
         let origin = POINT { x: -1280, y: 0 };
         let idle = pose(rect, origin, 1, None);
-        assert_eq!(idle.radius, 63);
+        assert_eq!(idle.radius, 95);
         assert_eq!(idle.thumb, (0, 0));
         assert!(!idle.active);
         let active = pose(
@@ -724,5 +743,32 @@ mod tests {
         assert!((0..255).contains(&alpha) && alpha > 0);
         assert!((pixel & 255) <= alpha);
         assert_eq!(paint_pixel(active, active.radius + 1, active.radius + 1), 0);
+    }
+
+    #[test]
+    fn larger_idle_sticks_fit_in_landscape_and_portrait() {
+        for (width, height, radius) in [(1646, 926, 122), (540, 1118, 72), (390, 844, 72)] {
+            let rect = RECT {
+                right: width,
+                bottom: height,
+                ..Default::default()
+            };
+            let stick = pose(rect, POINT::default(), 1, None);
+            assert_eq!(stick.radius, radius);
+            for action in PRIMARY {
+                let pad = primary_pose(rect, action);
+                let (dx, dy) = (pad.center.0 - stick.center.0, pad.center.1 - stick.center.1);
+                assert!(dx * dx + dy * dy >= (stick.radius + pad.radius).pow(2));
+            }
+        }
+
+        let rect = RECT {
+            right: 112,
+            bottom: 112,
+            ..Default::default()
+        };
+        let left = pose(rect, POINT::default(), 0, None);
+        let right = pose(rect, POINT::default(), 1, None);
+        assert!(right.center.0 - left.center.0 >= left.radius + right.radius);
     }
 }
