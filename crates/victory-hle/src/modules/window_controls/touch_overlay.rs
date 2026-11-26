@@ -28,20 +28,28 @@ pub(super) fn toggle_more() {
     MORE.set(!MORE.get());
 }
 
-fn visible(action: Action) -> bool {
-    MORE.get()
-        || matches!(
-            action,
-            Action::Lt
-                | Action::Rt
-                | Action::A
-                | Action::B
-                | Action::X
-                | Action::Y
-                | Action::Menu
-                | Action::More
-        )
-}
+const PRIMARY: [Action; 5] = [Action::Lt, Action::Rt, Action::A, Action::B, Action::More];
+const MENU_ROWS: [[Option<Action>; 4]; 4] = [
+    [
+        Some(Action::X),
+        Some(Action::Y),
+        Some(Action::Menu),
+        Some(Action::View),
+    ],
+    [
+        Some(Action::Lb),
+        Some(Action::Rb),
+        Some(Action::Ls),
+        Some(Action::Rs),
+    ],
+    [
+        Some(Action::Left),
+        Some(Action::Up),
+        Some(Action::Down),
+        Some(Action::Right),
+    ],
+    [None, Some(Action::Fullscreen), Some(Action::Close), None],
+];
 
 fn enabled() -> Option<bool> {
     static ENABLED: OnceLock<Option<bool>> = OnceLock::new();
@@ -128,7 +136,7 @@ fn update(
         return Ok(());
     }
     if !existing {
-        let pads = (0..2 + Action::ALL.len())
+        let pads = (0..3 + PRIMARY.len())
             .map(|_| Pad::new(owner))
             .collect::<io::Result<_>>()?;
         *state = Some((owner, pads));
@@ -136,20 +144,28 @@ fn update(
             watch_foreground(owner);
         }
     }
-    let (sticks, buttons) = state.as_mut().unwrap().1.split_at_mut(2);
+    let (sticks, controls) = state.as_mut().unwrap().1.split_at_mut(2);
+    let (menu, buttons) = controls.split_last_mut().unwrap();
     for (index, (pad, drag)) in sticks.iter_mut().zip(drags).enumerate() {
         pad.show(pose(rect, origin, index, drag))?;
     }
-    for (pad, action) in buttons.iter_mut().zip(Action::ALL) {
-        if !visible(action) {
-            pad.hide();
-            continue;
-        }
-        let mut pose = button_pose(rect, action);
+    for (pad, action) in buttons.iter_mut().zip(PRIMARY) {
+        let mut pose = primary_pose(rect, action);
         pose.center.0 += origin.x;
         pose.center.1 += origin.y;
         pose.active = action.in_mask(pressed);
         pad.show(pose)?;
+    }
+    if MORE.get() {
+        let primary_mask = PRIMARY
+            .into_iter()
+            .fold(0, |mask, action| mask | (1 << action as usize));
+        let mut pose = menu_pose(rect, pressed & !primary_mask);
+        pose.center.0 += origin.x;
+        pose.center.1 += origin.y;
+        menu.show(pose)?;
+    } else {
+        menu.hide();
     }
     Ok(())
 }
@@ -183,6 +199,31 @@ struct Pose {
     radius: i32,
     active: bool,
     button: Option<Action>,
+    menu: Option<MenuArt>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MenuArt {
+    cell: i32,
+    pressed: u32,
+}
+
+impl MenuArt {
+    fn item(self, x: i32, y: i32) -> Option<(Action, i32, i32)> {
+        let (col, row) = (x + 2 * self.cell, y + 2 * self.cell);
+        if col < 0 || row < 0 {
+            return None;
+        }
+        let action = MENU_ROWS
+            .get((row / self.cell) as usize)?
+            .get((col / self.cell) as usize)?
+            .as_ref()?;
+        Some((
+            *action,
+            col % self.cell - self.cell / 2,
+            row % self.cell - self.cell / 2,
+        ))
+    }
 }
 
 fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -> Pose {
@@ -205,54 +246,73 @@ fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -
         radius,
         active: drag.is_some(),
         button: None,
+        menu: None,
     }
 }
 
-fn button_pose(rect: RECT, action: Action) -> Pose {
-    let (x, y) = match action {
-        Action::Lt => (61, 84),
-        Action::Rt => (70, 75),
-        Action::A => (82, 56),
-        Action::B => (89, 47),
-        Action::X => (75, 47),
-        Action::Y => (82, 38),
-        Action::Menu => (94, 12),
-        Action::View => (86, 12),
-        Action::Lb => (23, 15),
-        Action::Rb => (77, 15),
-        Action::Ls => (33, 76),
-        Action::Rs => (94, 67),
-        Action::Up => (18, 38),
-        Action::Down => (18, 60),
-        Action::Left => (10, 49),
-        Action::Right => (26, 49),
-        Action::More => (94, 83),
-        Action::Fullscreen => (6, 12),
-        Action::Close => (6, 26),
-    };
+fn menu_pose(rect: RECT, pressed: u32) -> Pose {
+    let cell = (rect.right.min(rect.bottom) / 7).clamp(18, 112);
+    let radius = 2 * cell + 8;
     Pose {
-        center: (rect.right * x / 100, rect.bottom * y / 100),
+        center: (rect.right / 2, radius + (rect.bottom / 16).clamp(8, 48)),
         thumb: (0, 0),
-        radius: (rect.right.min(rect.bottom) / 31).clamp(3, 42),
+        radius,
+        active: false,
+        button: None,
+        menu: Some(MenuArt { cell, pressed }),
+    }
+}
+
+fn primary_pose(rect: RECT, action: Action) -> Pose {
+    let (x, y) = match action {
+        Action::Lt => (63, 87),
+        Action::Rt => (64, 72),
+        Action::A => (88, 53),
+        Action::B => (74, 53),
+        Action::More => (92, 15),
+        _ => unreachable!("secondary button has a menu position"),
+    };
+    let radius = (rect.right.min(rect.bottom) / 16).clamp(10, 64);
+    Pose {
+        center: (
+            (rect.right * x / 100).clamp(radius, rect.right - radius),
+            (rect.bottom * y / 100).clamp(radius, rect.bottom - radius),
+        ),
+        thumb: (0, 0),
+        radius,
         active: false,
         button: Some(action),
+        menu: None,
     }
+}
+
+pub(super) fn menu_covers(rect: RECT, point: POINT) -> bool {
+    if !MORE.get() || enabled() == Some(false) || rect.right.min(rect.bottom) < 112 {
+        return false;
+    }
+    let pose = menu_pose(rect, 0);
+    (point.x - pose.center.0).abs() <= pose.radius && (point.y - pose.center.1).abs() <= pose.radius
 }
 
 pub(super) fn button_at(rect: RECT, point: POINT) -> Option<Action> {
     if enabled() == Some(false) || rect.right.min(rect.bottom) < 112 {
         return None;
     }
-    Action::ALL
-        .into_iter()
-        .filter(|&action| visible(action))
-        .find(|&action| {
-            let pose = button_pose(rect, action);
-            let (dx, dy) = (point.x - pose.center.0, point.y - pose.center.1);
-            dx.abs() <= pose.radius
-                && dy.abs() <= pose.radius
-                && dx * dx + dy * dy <= pose.radius * pose.radius
-        })
+    if menu_covers(rect, point) {
+        let pose = menu_pose(rect, 0);
+        return pose
+            .menu
+            .unwrap()
+            .item(point.x - pose.center.0, point.y - pose.center.1)
+            .map(|(action, _, _)| action);
+    }
+    PRIMARY.into_iter().find(|&action| {
+        let pose = primary_pose(rect, action);
+        let (dx, dy) = (point.x - pose.center.0, point.y - pose.center.1);
+        dx.abs() <= pose.radius
+            && dy.abs() <= pose.radius
+            && dx * dx + dy * dy <= pose.radius * pose.radius
+    })
 }
 
 struct Pad {
@@ -476,7 +536,7 @@ fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
         Action::B => b"B",
         Action::X => b"X",
         Action::Y => b"Y",
-        Action::Menu => b"=",
+        Action::Menu => b"MENU",
         Action::View => b"VIEW",
         Action::Lb => b"LB",
         Action::Rb => b"RB",
@@ -512,10 +572,13 @@ fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
         b'F' => [7, 4, 6, 4, 4],
         b'I' => [7, 2, 2, 2, 7],
         b'L' => [4, 4, 4, 4, 7],
+        b'M' => [5, 7, 7, 5, 5],
+        b'N' => [5, 7, 7, 7, 5],
         b'O' => [2, 5, 5, 5, 2],
         b'R' => [6, 5, 6, 5, 5],
         b'S' => [7, 4, 7, 1, 7],
         b'T' => [7, 2, 2, 2, 2],
+        b'U' => [5, 5, 5, 5, 7],
         b'V' => [5, 5, 5, 5, 2],
         b'W' => [5, 5, 7, 7, 5],
         b'X' => [5, 5, 2, 5, 5],
@@ -532,6 +595,39 @@ fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
 }
 
 fn paint_pixel(pose: Pose, x: i32, y: i32) -> u32 {
+    if let Some(menu) = pose.menu {
+        let corner = 12;
+        let edge = pose.radius - corner;
+        let dx = (x.abs() - edge).max(0);
+        let dy = (y.abs() - edge).max(0);
+        let distance = ((dx * dx + dy * dy) as f32).sqrt();
+        let outer = coverage(distance, corner as f32);
+        let border = outer - coverage(distance, corner as f32 - 1.0);
+        let pixel = (0.84 * outer * 255.0).round() as u32;
+        let channel = |base: f32| (base * outer + 65.0 * border).round() as u32;
+        let background = pixel << 24 | channel(14.0) << 16 | channel(19.0) << 8 | channel(27.0);
+        let Some((action, dx, dy)) = menu.item(x, y) else {
+            return background;
+        };
+        let button = paint_pixel(
+            Pose {
+                center: (0, 0),
+                thumb: (0, 0),
+                radius: menu.cell / 2 - 5,
+                active: action.in_mask(menu.pressed),
+                button: Some(action),
+                menu: None,
+            },
+            dx,
+            dy,
+        );
+        let rest = 255 - (button >> 24);
+        return [0, 8, 16, 24].into_iter().fold(0, |pixel, shift| {
+            let front = (button >> shift) & 255;
+            let back = (background >> shift) & 255;
+            pixel | ((front + (back * rest + 127) / 255) << shift)
+        });
+    }
     let radius = pose.radius as f32;
     let distance = ((x * x + y * y) as f32).sqrt();
     let outer = coverage(distance, radius);
@@ -574,6 +670,33 @@ fn paint_pixel(pose: Pose, x: i32, y: i32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_controls_share_one_menu_and_primary_buttons_get_larger() {
+        let rect = RECT {
+            right: 1118,
+            bottom: 540,
+            ..Default::default()
+        };
+        let pose = menu_pose(rect, 0);
+        let cell = pose.menu.unwrap().cell;
+        let x = POINT {
+            x: pose.center.0 - 3 * cell / 2,
+            y: pose.center.1 - 3 * cell / 2,
+        };
+        let blank = POINT {
+            x: x.x,
+            y: pose.center.1 + 3 * cell / 2,
+        };
+        assert!(!menu_covers(rect, x));
+        assert!(button_at(rect, x).is_none());
+        toggle_more();
+        assert!(button_at(rect, x) == Some(Action::X));
+        assert!(menu_covers(rect, blank) && button_at(rect, blank).is_none());
+        toggle_more();
+        assert!(primary_pose(rect, Action::Rt).radius > (rect.bottom / 31));
+        assert!((175..255).contains(&(paint_pixel(pose, 0, 0) >> 24)));
+    }
 
     #[test]
     fn centers_stay_in_the_client_and_active_thumb_tracks_the_finger() {
