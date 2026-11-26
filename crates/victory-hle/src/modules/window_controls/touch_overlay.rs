@@ -237,7 +237,7 @@ fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -
         y: rect.bottom * 73 / 100,
     };
     let (anchor, finger) = drag.unwrap_or((fallback, fallback));
-    let feel = (rect.right.min(rect.bottom) as f32 * 0.10).clamp(32.0, 160.0);
+    let feel = super::stick_travel(rect);
     let [x, y] = super::stick(anchor, finger, feel, 0.0);
     let reach = radius as f32 * 0.64;
     Pose {

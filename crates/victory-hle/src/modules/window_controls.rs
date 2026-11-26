@@ -20,7 +20,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, PT_TOUCH};
 #[path = "window_controls/touch_overlay.rs"]
 mod touch_overlay;
 
-const LOOK_IDLE: Duration = Duration::from_millis(100);
 const FACE_TAP: Duration = Duration::from_millis(85);
 const START_FULLSCREEN: u32 = wm::WM_APP + 0x4a3;
 pub(super) fn hook_installed(hwnd: HWND) {
@@ -94,7 +93,6 @@ struct Drag {
     point: POINT,
     pixels: f32,
     axes: [f32; 2],
-    changed: Instant,
 }
 
 #[derive(Default)]
@@ -124,39 +122,30 @@ impl Touch {
         if touch_overlay::menu_covers(size, point) {
             return;
         }
-        let (slot, pixels) = if point.x < size.right / 2 {
-            (&mut self.left, (side * 0.10).clamp(32.0, 160.0))
+        let slot = if point.x < size.right / 2 {
+            &mut self.left
         } else {
-            (&mut self.right, side * 1.5)
+            &mut self.right
         };
         if slot.is_none() {
             *slot = Some(Drag {
                 contact,
                 anchor: point,
                 point,
-                pixels,
+                pixels: stick_travel(size),
                 axes: [0.0; 2],
-                changed: now,
             });
         }
     }
 
-    fn move_to(&mut self, contact: Contact, point: POINT, now: Instant) {
-        if let Some(left) = self.left.as_mut().filter(|drag| drag.contact == contact) {
-            left.axes = stick(left.anchor, point, left.pixels, 0.12);
-            left.point = point;
-        }
-        if let Some(right) = self.right.as_mut().filter(|drag| drag.contact == contact) {
-            if point.x == right.point.x && point.y == right.point.y {
-                return;
-            }
-            let seconds = now
-                .duration_since(right.changed)
-                .as_secs_f32()
-                .clamp(1.0 / 120.0, 1.0 / 30.0);
-            right.axes = stick(right.point, point, right.pixels * seconds, 0.0);
-            right.point = point;
-            right.changed = now;
+    fn move_to(&mut self, contact: Contact, point: POINT) {
+        if let Some(drag) = [&mut self.left, &mut self.right]
+            .into_iter()
+            .flatten()
+            .find(|drag| drag.contact == contact)
+        {
+            drag.axes = stick(drag.anchor, point, drag.pixels, 0.12);
+            drag.point = point;
         }
     }
 
@@ -199,15 +188,15 @@ impl Touch {
             })
     }
 
-    fn sticks(&self, now: Instant) -> [f32; 4] {
+    fn sticks(&self) -> [f32; 4] {
         let [lx, ly] = self.left.as_ref().map_or([0.0; 2], |drag| drag.axes);
-        let [rx, ry] = self
-            .right
-            .as_ref()
-            .filter(|drag| now.duration_since(drag.changed) < LOOK_IDLE)
-            .map_or([0.0; 2], |drag| drag.axes);
+        let [rx, ry] = self.right.as_ref().map_or([0.0; 2], |drag| drag.axes);
         [lx, ly, rx, ry]
     }
+}
+
+fn stick_travel(size: RECT) -> f32 {
+    (size.right.min(size.bottom) as f32 * 0.10).clamp(32.0, 160.0)
 }
 
 fn stick(from: POINT, to: POINT, pixels: f32, deadzone: f32) -> [f32; 2] {
@@ -233,7 +222,7 @@ pub(super) fn reading() -> ([f32; 4], u32) {
     let now = Instant::now();
     let buttons =
         touch.button_mask(|held, tap| held.is_some() || tap.is_some_and(|(_, until)| now < until));
-    (touch.sticks(now), buttons)
+    (touch.sticks(), buttons)
 }
 
 fn refresh_pads(hwnd: HWND) {
@@ -331,7 +320,7 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
                 if message == wm::WM_POINTERDOWN {
                     touch.start(contact, point, size, Instant::now());
                 } else {
-                    touch.move_to(contact, point, Instant::now());
+                    touch.move_to(contact, point);
                 }
             }
         }
@@ -534,16 +523,14 @@ mod tests {
         touch.start(left, POINT { x: 590, y: 400 }, size, now);
         touch.start(right, POINT { x: 610, y: 400 }, size, now);
         touch.start(extra, POINT { x: 400, y: 400 }, size, now);
-        let next = now + Duration::from_millis(16);
-        touch.move_to(left, POINT { x: 700, y: 400 }, next);
-        touch.move_to(right, POINT { x: 580, y: 400 }, next);
-        touch.move_to(extra, POINT { x: 500, y: 300 }, next);
-        assert_eq!(touch.sticks(next), [1.0, 0.0, -1.0, 0.0]);
-        assert_eq!(touch.sticks(next + LOOK_IDLE), [1.0, 0.0, 0.0, 0.0]);
+        touch.move_to(left, POINT { x: 700, y: 400 });
+        touch.move_to(right, POINT { x: 500, y: 400 });
+        touch.move_to(extra, POINT { x: 500, y: 300 });
+        assert_eq!(touch.sticks(), [1.0, 0.0, -1.0, 0.0]);
         assert!(touch.stop(|contact| contact == left));
-        assert_eq!(touch.sticks(next), [0.0, 0.0, -1.0, 0.0]);
+        assert_eq!(touch.sticks(), [0.0, 0.0, -1.0, 0.0]);
         assert!(touch.stop(|contact| contact.window == window));
-        assert_eq!(touch.sticks(next), [0.0; 4]);
+        assert_eq!(touch.sticks(), [0.0; 4]);
     }
 
     #[test]
@@ -560,17 +547,62 @@ mod tests {
         };
         touch.start(left, POINT { x: 288, y: 657 }, size, now);
         touch.start(rt, POINT { x: 1024, y: 648 }, size, now);
-        touch.move_to(left, POINT { x: 410, y: 657 }, now);
+        touch.move_to(left, POINT { x: 410, y: 657 });
         let mask = |state: &Touch| state.button_mask(|held, tap| held.is_some() || tap.is_some());
         assert!(Action::Rt.in_mask(mask(&touch)));
-        assert_eq!(touch.sticks(now), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(touch.sticks(), [1.0, 0.0, 0.0, 0.0]);
         assert!(touch.stop(|contact| contact == rt));
         touch.start(lt, POINT { x: 1008, y: 783 }, size, now);
         assert!(!Action::Rt.in_mask(mask(&touch)));
         assert!(Action::Lt.in_mask(mask(&touch)));
         touch.cancel(|contact| contact.window == 1);
         assert_eq!(mask(&touch), 0);
-        assert_eq!(touch.sticks(now), [0.0; 4]);
+        assert_eq!(touch.sticks(), [0.0; 4]);
+    }
+
+    #[test]
+    fn camera_stick_turns_at_a_held_offset_and_stops_at_center_or_release() {
+        let mut touch = Touch::default();
+        let contact = Contact { window: 1, id: 1 };
+        let size = RECT {
+            right: 1118,
+            bottom: 540,
+            ..Default::default()
+        };
+        let center = POINT { x: 916, y: 394 };
+        touch.start(contact, center, size, Instant::now());
+        for offset in 1..=40 {
+            touch.move_to(
+                contact,
+                POINT {
+                    x: center.x + offset,
+                    y: center.y,
+                },
+            );
+        }
+        let held = touch.sticks();
+        assert!(held[2] > 0.70 && held[2] < 0.71);
+        assert_eq!(held[3], 0.0);
+        touch.move_to(
+            contact,
+            POINT {
+                x: center.x + 40,
+                y: center.y,
+            },
+        );
+        assert_eq!(touch.sticks(), held);
+        touch.move_to(contact, center);
+        assert_eq!(touch.sticks(), [0.0; 4]);
+        touch.move_to(
+            contact,
+            POINT {
+                x: center.x,
+                y: center.y - 40,
+            },
+        );
+        assert!(touch.sticks()[3] > 0.70);
+        assert!(touch.stop(|active| active == contact));
+        assert_eq!(touch.sticks(), [0.0; 4]);
     }
 
     #[test]

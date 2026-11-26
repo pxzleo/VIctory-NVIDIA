@@ -246,8 +246,10 @@ still there for AMD cards.
 
 On a Windows touchscreen, drag anywhere in the left half of the game to move.
 The starting point anchors the virtual stick until you lift that finger. Drag
-in the right half to look around. Each touch keeps its role when it crosses the
-middle. You can hold **RT** to accelerate a boat and steer with the left stick
+in the right half to look around. Hold the right stick away from its starting
+point to keep turning, and return to the center or lift your finger to stop.
+Each touch keeps its role when it crosses the middle.
+You can hold **RT** to accelerate a boat and steer with the left stick
 at the same time. **LT** brakes or reverses. The main layout also has **A** and
 **B**. Tap **…** in the upper-right corner for **X/Y**, **MENU**, the D-pad,
 **LB/RB**, stick clicks **LS/RS**, **VIEW**, **FS** (fullscreen) and **OFF**
