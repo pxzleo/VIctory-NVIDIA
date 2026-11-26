@@ -546,7 +546,7 @@ mod tests {
             ..Default::default()
         };
         touch.start(left, POINT { x: 288, y: 657 }, size, now);
-        touch.start(rt, POINT { x: 1177, y: 522 }, size, now);
+        touch.start(rt, POINT { x: 1122, y: 657 }, size, now);
         touch.move_to(left, POINT { x: 410, y: 657 });
         let mask = |state: &Touch| state.button_mask(|held, tap| held.is_some() || tap.is_some());
         assert!(Action::Rt.in_mask(mask(&touch)));

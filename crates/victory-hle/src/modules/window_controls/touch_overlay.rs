@@ -236,28 +236,31 @@ fn action_radius(rect: RECT) -> i32 {
     (original_button_radius(rect) * 6 + 2) / 5
 }
 
-fn action_diagonal(stick: i32, button: i32) -> i32 {
-    ((stick + button + BUTTON_GAP) as f32 * std::f32::consts::FRAC_1_SQRT_2).ceil() as i32
+fn action_diagonal(reach: i32) -> i32 {
+    (reach as f32 * std::f32::consts::FRAC_1_SQRT_2).ceil() as i32
 }
 
 fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -> Pose {
     let previous = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
     let button = action_radius(rect);
-    let diagonal_room = rect.right.min(rect.bottom) / 2 - button - 2;
+    let vertical_room = rect.bottom - 2 * button - 5;
+    let max_reach = (vertical_room as f32 / (1.0 + std::f32::consts::FRAC_1_SQRT_2)) as i32;
     let radius = ((previous * 3 + 1) / 2)
-        .min(rect.right / 4 - 2)
         .min((rect.right - 4 * button - 16) / 3)
-        .min((diagonal_room as f32 * std::f32::consts::SQRT_2) as i32 - button - BUTTON_GAP);
+        .min((rect.right - 2 * button - 14) / 4)
+        .min(max_reach - button - BUTTON_GAP);
     let inset = radius + 2;
-    let idle_inset = if index == 1 {
-        button + action_diagonal(radius, button) + 2
-    } else {
-        inset
+    let mut fallback = POINT {
+        x: rect.right * [18, 82][index] / 100,
+        y: rect.bottom * 73 / 100,
     };
-    let fallback = POINT {
-        x: (rect.right * [18, 82][index] / 100).clamp(idle_inset, rect.right - idle_inset),
-        y: (rect.bottom * 73 / 100).clamp(idle_inset, rect.bottom - idle_inset),
-    };
+    if index == 1 {
+        let reach = radius + button + BUTTON_GAP;
+        let far_edge = button + reach + 2;
+        let bottom = rect.bottom - button - action_diagonal(reach) - 2;
+        fallback.x = fallback.x.clamp(far_edge, rect.right - inset);
+        fallback.y = fallback.y.clamp(far_edge, bottom);
+    }
     let (anchor, finger) = drag.unwrap_or((fallback, fallback));
     let feel = super::stick_travel(rect);
     let [x, y] = super::stick(anchor, finger, feel, 0.0);
@@ -299,12 +302,13 @@ fn primary_pose(rect: RECT, action: Action) -> Pose {
     } else {
         let stick = pose(rect, POINT::default(), 1, None);
         let radius = action_radius(rect);
-        let offset = action_diagonal(stick.radius, radius);
+        let reach = stick.radius + radius + BUTTON_GAP;
+        let offset = action_diagonal(reach);
         let (x, y) = match action {
-            Action::Rt => (-offset, -offset),
             Action::Lt => (-offset, offset),
-            Action::A => (offset, -offset),
-            Action::B => (offset, offset),
+            Action::Rt => (-reach, 0),
+            Action::A => (-offset, -offset),
+            Action::B => (0, -reach),
             _ => unreachable!("secondary button has a menu position"),
         };
         ((stick.center.0 + x, stick.center.1 + y), radius)
@@ -791,7 +795,14 @@ mod tests {
                 let (dx, dy) = (pad.center.0 - stick.center.0, pad.center.1 - stick.center.1);
                 assert!(dx * dx + dy * dy >= (stick.radius + pad.radius).pow(2));
                 if action != Action::More {
-                    assert_eq!(dx.abs(), dy.abs());
+                    let direction = match action {
+                        Action::Lt => (-1, 1),
+                        Action::Rt => (-1, 0),
+                        Action::A => (-1, -1),
+                        Action::B => (0, -1),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!((dx.signum(), dy.signum()), direction);
                     assert!(
                         button_at(
                             rect,
