@@ -21,6 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, PT_TOUCH};
 mod touch_overlay;
 
 const LOOK_IDLE: Duration = Duration::from_millis(100);
+const FACE_TAP: Duration = Duration::from_millis(85);
 const START_FULLSCREEN: u32 = wm::WM_APP + 0x4a3;
 pub(super) fn hook_installed(hwnd: HWND) {
     touch_overlay::start_for_touchscreen(hwnd);
@@ -30,6 +31,61 @@ pub(super) fn hook_installed(hwnd: HWND) {
 struct Contact {
     window: usize,
     id: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Action {
+    Lt,
+    Rt,
+    A,
+    B,
+    X,
+    Y,
+    Menu,
+    View,
+    Lb,
+    Rb,
+    Ls,
+    Rs,
+    Up,
+    Down,
+    Left,
+    Right,
+    More,
+    Fullscreen,
+    Close,
+}
+
+impl Action {
+    const ALL: [Self; 19] = [
+        Self::Lt,
+        Self::Rt,
+        Self::A,
+        Self::B,
+        Self::X,
+        Self::Y,
+        Self::Menu,
+        Self::View,
+        Self::Lb,
+        Self::Rb,
+        Self::Ls,
+        Self::Rs,
+        Self::Up,
+        Self::Down,
+        Self::Left,
+        Self::Right,
+        Self::More,
+        Self::Fullscreen,
+        Self::Close,
+    ];
+
+    pub(super) fn in_mask(self, mask: u32) -> bool {
+        mask & (1 << self as usize) != 0
+    }
+
+    fn command(self) -> bool {
+        matches!(self, Self::More | Self::Fullscreen | Self::Close)
+    }
 }
 
 struct Drag {
@@ -45,12 +101,24 @@ struct Drag {
 struct Touch {
     left: Option<Drag>,
     right: Option<Drag>,
+    buttons: [Option<Contact>; Action::ALL.len()],
+    taps: [Option<(Contact, Instant)>; Action::ALL.len()],
 }
 
 impl Touch {
     fn start(&mut self, contact: Contact, point: POINT, size: RECT, now: Instant) {
         let side = size.right.min(size.bottom) as f32;
         if side <= 0.0 {
+            return;
+        }
+        if let Some(action) = touch_overlay::button_at(size, point) {
+            let i = action as usize;
+            if self.buttons[i].is_none() {
+                self.buttons[i] = Some(contact);
+                if !action.command() && !matches!(action, Action::Lt | Action::Rt) {
+                    self.taps[i] = Some((contact, now + FACE_TAP));
+                }
+            }
             return;
         }
         let (slot, pixels) = if point.x < size.right / 2 {
@@ -97,7 +165,35 @@ impl Touch {
                 stopped = true;
             }
         }
+        for button in &mut self.buttons {
+            if button.is_some_and(&matches) {
+                *button = None;
+                stopped = true;
+            }
+        }
         stopped
+    }
+
+    fn cancel(&mut self, matches: impl Fn(Contact) -> bool) {
+        self.stop(&matches);
+        for tap in &mut self.taps {
+            if tap.is_some_and(|(contact, _)| matches(contact)) {
+                *tap = None;
+            }
+        }
+    }
+
+    fn button_mask(
+        &self,
+        pressed: impl Fn(Option<Contact>, Option<(Contact, Instant)>) -> bool,
+    ) -> u32 {
+        self.buttons
+            .iter()
+            .zip(self.taps)
+            .enumerate()
+            .fold(0, |mask, (i, (&held, tap))| {
+                mask | (u32::from(pressed(held, tap)) << i)
+            })
     }
 
     fn sticks(&self, now: Instant) -> [f32; 4] {
@@ -125,11 +221,16 @@ fn stick(from: POINT, to: POINT, pixels: f32, deadzone: f32) -> [f32; 2] {
 static TOUCH: Mutex<Touch> = Mutex::new(Touch {
     left: None,
     right: None,
+    buttons: [None; Action::ALL.len()],
+    taps: [None; Action::ALL.len()],
 });
 
-pub(super) fn sticks() -> [f32; 4] {
+pub(super) fn reading() -> ([f32; 4], u32) {
     let touch = TOUCH.lock().expect("touch state");
-    touch.sticks(Instant::now())
+    let now = Instant::now();
+    let buttons =
+        touch.button_mask(|held, tap| held.is_some() || tap.is_some_and(|(_, until)| now < until));
+    (touch.sticks(now), buttons)
 }
 
 fn refresh_pads(hwnd: HWND) {
@@ -139,8 +240,44 @@ fn refresh_pads(hwnd: HWND) {
             .filter(|drag| drag.contact.window == hwnd as usize)
             .map(|drag| (drag.anchor, drag.point))
     });
+    let buttons =
+        touch.button_mask(|held, _| held.is_some_and(|contact| contact.window == hwnd as usize));
     drop(touch);
-    touch_overlay::refresh(hwnd, drags);
+    touch_overlay::refresh(hwnd, drags, buttons);
+}
+
+fn release_pointer(hwnd: HWND, contact: Contact, mut point: POINT) {
+    let command = {
+        let mut touch = TOUCH.lock().expect("touch state");
+        let command = Action::ALL
+            .into_iter()
+            .find(|&action| action.command() && touch.buttons[action as usize] == Some(contact));
+        touch.stop(|active| active == contact);
+        command
+    };
+    let Some(command) = command else { return };
+    let mut size = RECT::default();
+    // SAFETY: the window is processing this touch's UP message, and outputs are writable.
+    if unsafe { ScreenToClient(hwnd, &mut point) == 0 || wm::GetClientRect(hwnd, &mut size) == 0 }
+        || touch_overlay::button_at(size, point) != Some(command)
+    {
+        return;
+    }
+    match command {
+        Action::More => touch_overlay::toggle_more(),
+        Action::Fullscreen => {
+            if let Err(error) = fullscreen(hwnd, false) {
+                tracing::warn!(%error, "could not switch title fullscreen mode");
+            }
+        }
+        Action::Close => {
+            // Use the same graceful close path as Alt+F4.
+            if unsafe { wm::PostMessageW(hwnd, wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize, 0) } == 0 {
+                tracing::warn!(error = %io::Error::last_os_error(), "could not close the title window");
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Win32 implicitly captures a touch to the window that receives DOWN.
@@ -167,13 +304,14 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
     let mut point = info.ptPixelLocation;
     let canceled = info.pointerFlags & POINTER_FLAG_CANCELED != 0;
     match message {
-        wm::WM_POINTERUP | wm::WM_POINTERCAPTURECHANGED => {
+        _ if canceled => {
             TOUCH
                 .lock()
                 .expect("touch state")
-                .stop(|active| active == contact);
+                .cancel(|active| active == contact);
         }
-        _ if canceled => {
+        wm::WM_POINTERUP => release_pointer(hwnd, contact, point),
+        wm::WM_POINTERCAPTURECHANGED => {
             TOUCH
                 .lock()
                 .expect("touch state")
@@ -318,7 +456,7 @@ pub(super) fn message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) 
             TOUCH
                 .lock()
                 .expect("touch state")
-                .stop(|contact| contact.window == hwnd as usize);
+                .cancel(|contact| contact.window == hwnd as usize);
             if message == wm::WM_NCDESTROY {
                 touch_overlay::forget(hwnd);
             } else if message == wm::WM_KILLFOCUS {
@@ -403,6 +541,33 @@ mod tests {
         assert_eq!(touch.sticks(next), [0.0, 0.0, -1.0, 0.0]);
         assert!(touch.stop(|contact| contact.window == window));
         assert_eq!(touch.sticks(next), [0.0; 4]);
+    }
+
+    #[test]
+    fn throttle_is_independent_of_steering_and_releases_immediately() {
+        let mut touch = Touch::default();
+        let now = Instant::now();
+        let left = Contact { window: 1, id: 1 };
+        let rt = Contact { window: 1, id: 2 };
+        let lt = Contact { window: 1, id: 3 };
+        let size = RECT {
+            right: 1600,
+            bottom: 900,
+            ..Default::default()
+        };
+        touch.start(left, POINT { x: 288, y: 657 }, size, now);
+        touch.start(rt, POINT { x: 1120, y: 675 }, size, now);
+        touch.move_to(left, POINT { x: 410, y: 657 }, now);
+        let mask = |state: &Touch| state.button_mask(|held, tap| held.is_some() || tap.is_some());
+        assert!(Action::Rt.in_mask(mask(&touch)));
+        assert_eq!(touch.sticks(now), [1.0, 0.0, 0.0, 0.0]);
+        assert!(touch.stop(|contact| contact == rt));
+        touch.start(lt, POINT { x: 976, y: 756 }, size, now);
+        assert!(!Action::Rt.in_mask(mask(&touch)));
+        assert!(Action::Lt.in_mask(mask(&touch)));
+        touch.cancel(|contact| contact.window == 1);
+        assert_eq!(mask(&touch), 0);
+        assert_eq!(touch.sticks(now), [0.0; 4]);
     }
 
     #[test]

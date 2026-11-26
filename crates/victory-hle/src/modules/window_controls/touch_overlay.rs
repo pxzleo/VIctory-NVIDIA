@@ -1,6 +1,6 @@
 //! Two small desktop-composited controls. They never render into the swap chain.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
@@ -14,11 +14,33 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 use windows_sys::core::w;
 
+use super::Action;
+
 type Drags = [Option<(POINT, POINT)>; 2];
 pub(super) const REFRESH_TIMER: usize = 0x64a4;
 
 thread_local! {
-    static OVERLAY: RefCell<Option<(HWND, [Pad; 2])>> = const { RefCell::new(None) };
+    static OVERLAY: RefCell<Option<(HWND, Vec<Pad>)>> = const { RefCell::new(None) };
+    static MORE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn toggle_more() {
+    MORE.set(!MORE.get());
+}
+
+fn visible(action: Action) -> bool {
+    MORE.get()
+        || matches!(
+            action,
+            Action::Lt
+                | Action::Rt
+                | Action::A
+                | Action::B
+                | Action::X
+                | Action::Y
+                | Action::Menu
+                | Action::More
+        )
 }
 
 fn enabled() -> Option<bool> {
@@ -50,7 +72,7 @@ fn watch_foreground(hwnd: HWND) {
     }
 }
 
-pub(super) fn refresh(owner: HWND, drags: Drags) {
+pub(super) fn refresh(owner: HWND, drags: Drags, pressed: u32) {
     if enabled() == Some(false) {
         return;
     }
@@ -58,14 +80,19 @@ pub(super) fn refresh(owner: HWND, drags: Drags) {
         let Ok(mut state) = state.try_borrow_mut() else {
             return;
         };
-        if let Err(error) = update(&mut state, owner, drags) {
+        if let Err(error) = update(&mut state, owner, drags, pressed) {
             static LOGGED: std::sync::Once = std::sync::Once::new();
             LOGGED.call_once(|| tracing::warn!(%error, "could not display the touch controls"));
         }
     });
 }
 
-fn update(state: &mut Option<(HWND, [Pad; 2])>, owner: HWND, drags: Drags) -> io::Result<()> {
+fn update(
+    state: &mut Option<(HWND, Vec<Pad>)>,
+    owner: HWND,
+    drags: Drags,
+    pressed: u32,
+) -> io::Result<()> {
     let existing = state.as_ref().is_some_and(|(window, _)| *window == owner);
     // SAFETY: the caller owns this live title window.
     let active = unsafe {
@@ -81,7 +108,7 @@ fn update(state: &mut Option<(HWND, [Pad; 2])>, owner: HWND, drags: Drags) -> io
         }
         return Ok(());
     }
-    if !existing && enabled() != Some(true) && drags.iter().all(Option::is_none) {
+    if !existing && enabled() != Some(true) && drags.iter().all(Option::is_none) && pressed == 0 {
         return Ok(());
     }
     let mut rect = RECT::default();
@@ -101,14 +128,28 @@ fn update(state: &mut Option<(HWND, [Pad; 2])>, owner: HWND, drags: Drags) -> io
         return Ok(());
     }
     if !existing {
-        *state = Some((owner, [Pad::new(owner)?, Pad::new(owner)?]));
+        let pads = (0..2 + Action::ALL.len())
+            .map(|_| Pad::new(owner))
+            .collect::<io::Result<_>>()?;
+        *state = Some((owner, pads));
         if enabled().is_none() {
             watch_foreground(owner);
         }
     }
-    let pads = &mut state.as_mut().unwrap().1;
-    for (index, (pad, drag)) in pads.iter_mut().zip(drags).enumerate() {
+    let (sticks, buttons) = state.as_mut().unwrap().1.split_at_mut(2);
+    for (index, (pad, drag)) in sticks.iter_mut().zip(drags).enumerate() {
         pad.show(pose(rect, origin, index, drag))?;
+    }
+    for (pad, action) in buttons.iter_mut().zip(Action::ALL) {
+        if !visible(action) {
+            pad.hide();
+            continue;
+        }
+        let mut pose = button_pose(rect, action);
+        pose.center.0 += origin.x;
+        pose.center.1 += origin.y;
+        pose.active = action.in_mask(pressed);
+        pad.show(pose)?;
     }
     Ok(())
 }
@@ -118,6 +159,7 @@ pub(super) fn forget(hwnd: HWND) {
         let mut state = state.borrow_mut();
         if state.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
             *state = None;
+            MORE.set(false);
         }
     });
 }
@@ -140,10 +182,11 @@ struct Pose {
     thumb: (i32, i32),
     radius: i32,
     active: bool,
+    button: Option<Action>,
 }
 
 fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -> Pose {
-    let radius = (rect.right.min(rect.bottom) / 17).clamp(32, 76);
+    let radius = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
     let inset = radius + 2;
     let fallback = POINT {
         x: rect.right * [18, 82][index] / 100,
@@ -161,7 +204,55 @@ fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -
         thumb: ((x * reach).round() as i32, (-y * reach).round() as i32),
         radius,
         active: drag.is_some(),
+        button: None,
     }
+}
+
+fn button_pose(rect: RECT, action: Action) -> Pose {
+    let (x, y) = match action {
+        Action::Lt => (61, 84),
+        Action::Rt => (70, 75),
+        Action::A => (82, 56),
+        Action::B => (89, 47),
+        Action::X => (75, 47),
+        Action::Y => (82, 38),
+        Action::Menu => (94, 12),
+        Action::View => (86, 12),
+        Action::Lb => (23, 15),
+        Action::Rb => (77, 15),
+        Action::Ls => (33, 76),
+        Action::Rs => (94, 67),
+        Action::Up => (18, 38),
+        Action::Down => (18, 60),
+        Action::Left => (10, 49),
+        Action::Right => (26, 49),
+        Action::More => (94, 83),
+        Action::Fullscreen => (6, 12),
+        Action::Close => (6, 26),
+    };
+    Pose {
+        center: (rect.right * x / 100, rect.bottom * y / 100),
+        thumb: (0, 0),
+        radius: (rect.right.min(rect.bottom) / 31).clamp(3, 42),
+        active: false,
+        button: Some(action),
+    }
+}
+
+pub(super) fn button_at(rect: RECT, point: POINT) -> Option<Action> {
+    if enabled() == Some(false) || rect.right.min(rect.bottom) < 112 {
+        return None;
+    }
+    Action::ALL
+        .into_iter()
+        .filter(|&action| visible(action))
+        .find(|&action| {
+            let pose = button_pose(rect, action);
+            let (dx, dy) = (point.x - pose.center.0, point.y - pose.center.1);
+            dx.abs() <= pose.radius
+                && dy.abs() <= pose.radius
+                && dx * dx + dy * dy <= pose.radius * pose.radius
+        })
 }
 
 struct Pad {
@@ -377,19 +468,104 @@ fn coverage(distance: f32, radius: f32) -> f32 {
     (radius - distance + 0.5).clamp(0.0, 1.0)
 }
 
+fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
+    let text: &[u8] = match action {
+        Action::Lt => b"LT",
+        Action::Rt => b"RT",
+        Action::A => b"A",
+        Action::B => b"B",
+        Action::X => b"X",
+        Action::Y => b"Y",
+        Action::Menu => b"=",
+        Action::View => b"VIEW",
+        Action::Lb => b"LB",
+        Action::Rb => b"RB",
+        Action::Ls => b"LS",
+        Action::Rs => b"RS",
+        Action::Up => b"^",
+        Action::Down => b"v",
+        Action::Left => b"<",
+        Action::Right => b">",
+        Action::More if MORE.get() => b"-",
+        Action::More => b"...",
+        Action::Fullscreen => b"FS",
+        Action::Close => b"OFF",
+    };
+    let width = 4 * text.len() as i32 - 1;
+    let scale = (radius * 3 / (2 * width.max(10))).max(1);
+    let x = x + width * scale / 2;
+    let y = y + 5 * scale / 2;
+    if x < 0 || !(0..5 * scale).contains(&y) {
+        return false;
+    }
+    let column = (x / scale) % 4;
+    if column == 3 {
+        return false;
+    }
+    let Some(&letter) = text.get((x / scale / 4) as usize) else {
+        return false;
+    };
+    let glyph = match letter {
+        b'A' => [2, 5, 7, 5, 5],
+        b'B' => [6, 5, 6, 5, 6],
+        b'E' => [7, 4, 6, 4, 7],
+        b'F' => [7, 4, 6, 4, 4],
+        b'I' => [7, 2, 2, 2, 7],
+        b'L' => [4, 4, 4, 4, 7],
+        b'O' => [2, 5, 5, 5, 2],
+        b'R' => [6, 5, 6, 5, 5],
+        b'S' => [7, 4, 7, 1, 7],
+        b'T' => [7, 2, 2, 2, 2],
+        b'V' => [5, 5, 5, 5, 2],
+        b'W' => [5, 5, 7, 7, 5],
+        b'X' => [5, 5, 2, 5, 5],
+        b'Y' => [5, 5, 2, 2, 2],
+        b'^' => [2, 7, 2, 2, 2],
+        b'v' => [2, 2, 2, 7, 2],
+        b'<' => [1, 2, 7, 2, 1],
+        b'>' => [4, 2, 7, 2, 4],
+        b'.' => [0, 0, 0, 0, 2],
+        b'-' => [0, 0, 7, 0, 0],
+        _ => [7, 0, 7, 0, 7],
+    };
+    glyph[(y / scale) as usize] & (4 >> column) != 0
+}
+
 fn paint_pixel(pose: Pose, x: i32, y: i32) -> u32 {
     let radius = pose.radius as f32;
     let distance = ((x * x + y * y) as f32).sqrt();
     let outer = coverage(distance, radius);
+    if outer == 0.0 {
+        return 0;
+    }
     let inner = coverage(distance, radius - 1.6);
-    let (dx, dy) = (x - pose.thumb.0, y - pose.thumb.1);
-    let thumb_distance = ((dx * dx + dy * dy) as f32).sqrt();
-    let thumb = coverage(thumb_distance, radius * 0.28) * if pose.active { 0.76 } else { 0.38 };
+    let thumb = if let Some(action) = pose.button {
+        if label(action, pose.radius, x, y) {
+            0.92
+        } else {
+            0.0
+        }
+    } else {
+        let (dx, dy) = (x - pose.thumb.0, y - pose.thumb.1);
+        let thumb_distance = ((dx * dx + dy * dy) as f32).sqrt();
+        coverage(thumb_distance, radius * 0.28) * if pose.active { 0.76 } else { 0.38 }
+    };
     let ring = (outer - inner) * if pose.active { 0.69 } else { 0.47 };
-    let shade = inner * if pose.active { 0.24 } else { 0.17 };
+    let shade = inner
+        * match (pose.button.is_some(), pose.active) {
+            (true, true) => 0.48,
+            (true, false) => 0.34,
+            (false, true) => 0.24,
+            (false, false) => 0.17,
+        };
     let base = ring + shade;
     let alpha = thumb + base * (1.0 - thumb);
-    let rgb = [235.0, 248.0, 255.0].map(|value| {
+    let tint = if pose.button.is_some() && pose.active {
+        [146.0, 232.0, 255.0]
+    } else {
+        [235.0, 248.0, 255.0]
+    };
+    let rgb = tint.map(|value| {
         (value * thumb + (value * ring + 18.0 * shade) * (1.0 - thumb)).round() as u32
     });
     ((alpha * 255.0).round() as u32) << 24 | rgb[0] << 16 | rgb[1] << 8 | rgb[2]
@@ -408,6 +584,7 @@ mod tests {
         };
         let origin = POINT { x: -1280, y: 0 };
         let idle = pose(rect, origin, 1, None);
+        assert_eq!(idle.radius, 63);
         assert_eq!(idle.thumb, (0, 0));
         assert!(!idle.active);
         let active = pose(

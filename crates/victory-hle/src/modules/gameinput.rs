@@ -1250,13 +1250,24 @@ mod host {
         }
 
         fn touch(&mut self) -> PadState {
-            let [left_x, left_y, right_x, right_y] = super::super::window_controls::sticks();
+            use super::super::window_controls::{Action, reading};
+            let ([left_x, left_y, right_x, right_y], held) = reading();
+            let pressed = |action: Action| action.in_mask(held);
+            let buttons = [
+                (Action::A, A), (Action::B, B), (Action::X, X), (Action::Y, Y),
+                (Action::Menu, MENU), (Action::View, VIEW),
+                (Action::Lb, LEFT_SHOULDER), (Action::Rb, RIGHT_SHOULDER),
+                (Action::Ls, LEFT_STICK), (Action::Rs, RIGHT_STICK),
+                (Action::Up, UP), (Action::Down, DOWN), (Action::Left, LEFT), (Action::Right, RIGHT),
+            ].into_iter().filter(|(action, _)| pressed(*action)).fold(0, |mask, (_, bit)| mask | bit);
             PadState {
+                buttons,
+                left_trigger: f32::from(pressed(Action::Lt)),
+                right_trigger: f32::from(pressed(Action::Rt)),
                 left_x,
                 left_y,
                 right_x,
                 right_y,
-                ..PadState::default()
             }
         }
 

@@ -246,14 +246,17 @@ still there for AMD cards.
 
 On a Windows touchscreen, drag anywhere in the left half of the game to move.
 The starting point anchors the virtual stick until you lift that finger. Drag
-in the right half to look around. Both fingers work at the same time, and each
-keeps its role when it crosses the middle. Use the keyboard or a controller for
-game buttons and menus.
+in the right half to look around. Each touch keeps its role when it crosses the
+middle. You can hold **RT** to accelerate a boat and steer with the left stick
+at the same time. **LT** brakes or reverses. The **A**, **B**, **X**, **Y** and
+menu buttons send the corresponding controller inputs for the current scene.
+Tap **…** for the D-pad, **LB/RB**, stick clicks **LS/RS**, **VIEW**,
+**FS** (toggle fullscreen) and **OFF** (quit the game).
 
 The translucent guides rest near the lower corners, then follow each touch's
 starting point while you drag. They appear on a detected touchscreen or
 after your first touch. Set `VICTORY_TOUCH_OVERLAY=1` to show them from startup
-or `0` to keep the touch controls without the guides.
+or `0` to hide the guides and buttons while keeping the two touch sticks.
 
 Press **F11** to switch between a window and borderless fullscreen on the
 current monitor. To start fullscreen, pass `-More @{VICTORY_FULLSCREEN='1'}`
