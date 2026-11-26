@@ -8675,9 +8675,7 @@ impl PresentWhiteSample {
         let primary_white = crate::capture::white_pixels(&self.primary);
         let composite_white = self.composite.as_ref().and_then(crate::capture::white_pixels);
         tracing::info!(frame = self.frame, ?primary_white, ?composite_white, "present white probe (16 pixels)");
-        if primary_white == Some(16) || composite_white == Some(16) {
-            crate::capture::dump_white_sample();
-        }
+        crate::capture::dump_white_sample(primary_white == Some(16) || composite_white == Some(16));
     }
 }
 

@@ -174,7 +174,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() && !white_dump() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -836,11 +836,18 @@ pub(crate) fn probe_present_white(frame: u64) -> bool {
     }).is_some_and(|n| frame % n == 0)
 }
 
-/// Request the existing render-target and operation dump while white persists.
-pub(crate) fn dump_white_sample() {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+fn white_dump() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WHITE_DUMP"))
+}
+
+/// Request the existing render-target and operation dump after two white
+/// samples, to avoid stopping a flight on an isolated transition flash.
+pub(crate) fn dump_white_sample(white: bool) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     static LAST: AtomicU64 = AtomicU64::new(0);
-    if !dump_on() || !crate::switch::on("VICTORY_WHITE_DUMP") {
+    static PREVIOUS_WHITE: AtomicBool = AtomicBool::new(false);
+    if !white_dump() || !dump_on() || !PREVIOUS_WHITE.swap(white, Relaxed) || !white {
         return;
     }
     let now = crate::queue::presented();
