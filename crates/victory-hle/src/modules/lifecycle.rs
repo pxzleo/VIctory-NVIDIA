@@ -238,6 +238,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    super::window_controls::hook_installed(hwnd);
 }
 
 extern "system" fn window_proc(

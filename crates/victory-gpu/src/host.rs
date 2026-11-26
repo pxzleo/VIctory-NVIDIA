@@ -9283,6 +9283,7 @@ fn title_window() -> Option<HWND> {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
+                && GetPropW(hwnd, windows::core::w!("victory.touch-pad")).is_invalid()
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();

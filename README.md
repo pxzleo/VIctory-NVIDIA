@@ -250,6 +250,11 @@ in the right half to look around. Both fingers work at the same time, and each
 keeps its role when it crosses the middle. Use the keyboard or a controller for
 game buttons and menus.
 
+The translucent guides rest near the lower corners, then follow each touch's
+starting point while you drag. They appear on a detected touchscreen or
+after your first touch. Set `VICTORY_TOUCH_OVERLAY=1` to show them from startup
+or `0` to keep the touch controls without the guides.
+
 Press **F11** to switch between a window and borderless fullscreen on the
 current monitor. To start fullscreen, pass `-More @{VICTORY_FULLSCREEN='1'}`
 to `play-nvidia.ps1` or set `VICTORY_FULLSCREEN=1` when launching Victory

@@ -17,8 +17,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F11;
 use windows_sys::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_FLAG_CANCELED, POINTER_INFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, PT_TOUCH};
 
+#[path = "window_controls/touch_overlay.rs"]
+mod touch_overlay;
+
 const LOOK_IDLE: Duration = Duration::from_millis(100);
 const START_FULLSCREEN: u32 = wm::WM_APP + 0x4a3;
+pub(super) fn hook_installed(hwnd: HWND) {
+    touch_overlay::start_for_touchscreen(hwnd);
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Contact {
@@ -28,6 +34,7 @@ struct Contact {
 
 struct Drag {
     contact: Contact,
+    anchor: POINT,
     point: POINT,
     pixels: f32,
     axes: [f32; 2],
@@ -54,6 +61,7 @@ impl Touch {
         if slot.is_none() {
             *slot = Some(Drag {
                 contact,
+                anchor: point,
                 point,
                 pixels,
                 axes: [0.0; 2],
@@ -64,7 +72,8 @@ impl Touch {
 
     fn move_to(&mut self, contact: Contact, point: POINT, now: Instant) {
         if let Some(left) = self.left.as_mut().filter(|drag| drag.contact == contact) {
-            left.axes = stick(left.point, point, left.pixels, 0.12);
+            left.axes = stick(left.anchor, point, left.pixels, 0.12);
+            left.point = point;
         }
         if let Some(right) = self.right.as_mut().filter(|drag| drag.contact == contact) {
             if point.x == right.point.x && point.y == right.point.y {
@@ -123,6 +132,17 @@ pub(super) fn sticks() -> [f32; 4] {
     touch.sticks(Instant::now())
 }
 
+fn refresh_pads(hwnd: HWND) {
+    let touch = TOUCH.lock().expect("touch state");
+    let drags = [&touch.left, &touch.right].map(|slot| {
+        slot.as_ref()
+            .filter(|drag| drag.contact.window == hwnd as usize)
+            .map(|drag| (drag.anchor, drag.point))
+    });
+    drop(touch);
+    touch_overlay::refresh(hwnd, drags);
+}
+
 /// Win32 implicitly captures a touch to the window that receives DOWN.
 fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
     let contact = Contact {
@@ -132,11 +152,14 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
     let mut info = POINTER_INFO::default();
     // SAFETY: the ID belongs to this pointer message and info is writable.
     if unsafe { GetPointerInfo(contact.id, &mut info) } == 0 {
-        return TOUCH
+        let stopped = TOUCH
             .lock()
             .expect("touch state")
-            .stop(|active| active == contact)
-            .then_some(0);
+            .stop(|active| active == contact);
+        if stopped {
+            refresh_pads(hwnd);
+        }
+        return stopped.then_some(0);
     }
     if info.pointerType != PT_TOUCH {
         return None;
@@ -173,6 +196,7 @@ fn pointer(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
         }
         _ => {}
     }
+    refresh_pads(hwnd);
     // Keep touch from also being promoted to gesture or mouse input.
     Some(0)
 }
@@ -295,11 +319,26 @@ pub(super) fn message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) 
                 .lock()
                 .expect("touch state")
                 .stop(|contact| contact.window == hwnd as usize);
+            if message == wm::WM_NCDESTROY {
+                touch_overlay::forget(hwnd);
+            } else if message == wm::WM_KILLFOCUS {
+                touch_overlay::hide(hwnd);
+            } else {
+                refresh_pads(hwnd);
+            }
             if message == wm::WM_NCDESTROY
                 && WINDOWED.get().is_some_and(|(window, _)| window == hwnd)
             {
                 WINDOWED.set(None);
             }
+        }
+        wm::WM_ACTIVATE if wparam & 0xffff == wm::WA_INACTIVE as usize => touch_overlay::hide(hwnd),
+        wm::WM_ACTIVATE | wm::WM_ACTIVATEAPP | wm::WM_SETFOCUS | wm::WM_WINDOWPOSCHANGED => {
+            refresh_pads(hwnd)
+        }
+        wm::WM_TIMER if wparam == touch_overlay::REFRESH_TIMER => {
+            refresh_pads(hwnd);
+            return Some(0);
         }
         wm::WM_KEYDOWN if wparam == VK_F11 as usize => {
             if (lparam & (1 << 30)) == 0 {
