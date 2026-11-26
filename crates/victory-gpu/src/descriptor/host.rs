@@ -40,23 +40,32 @@ impl Slots {
         })
     }
 
-    fn of(n: usize, mut bits: u64, out: &mut Vec<u32>, which: &impl Fn(u32) -> bool) {
+    fn of(n: usize, mut bits: u64, out: &mut Vec<u32>) {
         while bits != 0 {
-            let slot = n as u32 * 64 + bits.trailing_zeros();
+            out.push(n as u32 * 64 + bits.trailing_zeros());
             bits &= bits - 1;
-            if which(slot) {
-                out.push(slot);
-            }
         }
     }
 
-    /// Those that `which` says, in order.
-    fn all(&self, which: impl Fn(u32) -> bool) -> Vec<u32> {
+    /// The set slots selected by the same mask in each 64-slot word, in order.
+    fn all(&self, mask: u64) -> Vec<u32> {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
-            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire), &mut out, &which);
+            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire) & mask, &mut out);
         }
         out
+    }
+
+    /// One part of a round-robin scan. The pattern repeats at every word boundary.
+    fn part<const PARTS: u32>(&self, part: u32) -> Vec<u32> {
+        const { assert!(PARTS > 0 && u64::BITS % PARTS == 0) };
+        if part >= PARTS {
+            return Vec::new();
+        }
+        let mask = (part..u64::BITS)
+            .step_by(PARTS as usize)
+            .fold(0, |mask, bit| mask | (1 << bit));
+        self.all(mask)
     }
 
     /// All of them, and none is left.
@@ -65,7 +74,7 @@ impl Slots {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
             if bits.load(Acquire) != 0 {
-                Self::of(n, bits.swap(0, AcqRel), &mut out, &|_| true);
+                Self::of(n, bits.swap(0, AcqRel), &mut out);
             }
         }
         out
@@ -2226,7 +2235,7 @@ impl HostHeap {
             && index < self.count
             && !self.texture_slot_made_from(index, handle)
             && let Some(view) = super::view(handle)
-            && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
+            && let Some(View::Shader(resource, _)) = placed_texture(&view).map(|placed| placed.view).or(Some(view))
             && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
             && crate::resource::host_resource(resource as crate::object::This).is_some_and(crate::pool::fresh)
             && !crate::texture::ahead::there(resource as crate::object::This)
@@ -2454,13 +2463,13 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        self.buffers.all(|_| true)
+        self.buffers.all(u64::MAX)
     }
 
-    /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
+    /// Of [`HostHeap::buffer_slots`], those of one of `PARTS` parts: every
     /// slot is in the same part each time.
-    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
+    pub(crate) fn buffer_slots_of<const PARTS: u32>(&self, part: u32) -> Vec<u32> {
+        self.buffers.part::<PARTS>(part)
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -4047,6 +4056,18 @@ fn make_twinned(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // A view the title placed over a texture the host writes, in a
+            // format a view of that texture can have: the texture itself
+            // (`crate::resource::cast_source`), not a copy of it.
+            if let (Some((_, source)), Some(d)) = (crate::resource::cast_source(resource), desc.as_ref()) {
+                let mut view = srv_desc(d);
+                view.Format = DXGI_FORMAT(67);
+                // SAFETY: a live texture made castable to that format, and a
+                // slot of our heap.
+                unsafe { device.CreateShaderResourceView(&source, Some(&view), at) };
+                return Some(Some(source));
+            }
+            crate::resource::shown_uncast(resource);
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
@@ -4199,7 +4220,25 @@ fn make_twinned(
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                let made = make(&view.view, at);
+                #[cfg(feature = "diagnostics")]
+                if *unordered && made.as_ref().is_some_and(Option::is_some) {
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    FIRST.call_once(|| {
+                        tracing::info!(
+                            dimension = resource[0],
+                            resource_format = resource[8],
+                            view_format = desc[0],
+                            flags = resource[12],
+                            address = format_args!(
+                                "{:#x}",
+                                u64::from(desc[10]) | u64::from(desc[11]) << 32
+                            ),
+                            "mirrored a placed texture UAV"
+                        )
+                    });
+                }
+                return made;
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -4213,13 +4252,32 @@ fn make_twinned(
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    resource.hash(&mut h);
+                    desc.hash(&mut h);
+                    h.finish()
+                };
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
+                let mut around = [0u32; 48];
+                // SAFETY: the title's own record around the description.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        std::ptr::from_ref(desc).cast::<u32>().sub(24),
+                        around.as_mut_ptr(),
+                        around.len(),
+                    )
+                };
+                if (said.len() < 512 && said.insert(key)) || times.is_power_of_two() {
+                    #[cfg(all(windows, feature = "diagnostics"))]
+                    let (keys, addresses) = crate::resource::placed_textures_like(resource);
+                    #[cfg(not(all(windows, feature = "diagnostics")))]
+                    let (keys, addresses): (usize, Vec<u64>) = (0, Vec::new());
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
+                        "placed unordered texture view that is not mirrored (null: writes through it are lost): unordered {unordered}, resource {resource:?}, desc {desc:?}, around {around:?}, matches {keys}, addresses {addresses:?}",
                     );
                 }
                 return None;
@@ -4532,20 +4590,54 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+/// A placed texture view's host view, and the title resource it holds (when
+/// the memory belongs to one).
+pub(crate) struct PlacedTexture {
+    pub(crate) view: View,
+    _owner: Option<crate::resource::ResourceRef>,
+}
+
+/// A placed texture's view on its host resource: of the title resource that
+/// writes the memory when there is one, else of a synthetic copy. UAV
+/// writes must land on the title resource (a synthetic copy would keep
+/// them).
+pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
-    if resource[0] == BUFFER {
+    #[cfg(feature = "diagnostics")]
+    if *unordered && resource[0] != BUFFER && resource[12] & 4 == 0 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 24 {
+            tracing::warn!(n, "placed texture UAV probe: resource {resource:?} desc {desc:?}");
+        }
+    }
+    if resource[0] == BUFFER || (*unordered && resource[12] & 4 == 0) {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    let owner = if resource[12] & 4 != 0 {
+        crate::resource::writable_texture_at(address, resource)
+    } else {
+        None
+    };
+    let texture = match &owner {
+        Some(owner) => owner.as_ptr(),
+        // Unordered needed a resource the title gave; a synthetic one with
+        // no writable flag would drop writes.
+        None if *unordered => return None,
+        None => crate::resource::texture_at(address, resource)?,
+    };
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    let view = if *unordered {
+        View::Unordered(texture as usize, 0, words)
+    } else {
+        View::Shader(texture as usize, words)
+    };
+    Some(PlacedTexture { view, _owner: owner })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -5741,11 +5833,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         for slot in [199, 0, 64, 63, 130, 64] {
             set.put(slot);
         }
-        assert_eq!(set.all(|_| true), [0, 63, 64, 130, 199]);
-        assert_eq!(set.all(|slot| slot % 2 == 0), [0, 64, 130]);
+        assert_eq!(set.all(u64::MAX), [0, 63, 64, 130, 199]);
+        assert_eq!(set.part::<2>(0), [0, 64, 130]);
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    #[test]
+    fn spread_scan_visits_each_live_slot_in_its_original_part() {
+        let set = Slots::new(201);
+        let live: Vec<u32> = (0..201).filter(|slot| slot % 5 != 2).collect();
+        for &slot in &live {
+            set.put(slot);
+        }
+        for part in 0..16 {
+            let expected: Vec<_> = live.iter().copied().filter(|slot| slot % 16 == part).collect();
+            assert_eq!(set.part::<16>(part), expected);
+        }
+        assert!(set.part::<16>(16).is_empty());
+        assert_eq!(set.take(), live);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's
@@ -5784,6 +5891,32 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// Small heaps and a dynamic range ending at the cap must leave the
+    /// shader's clamp target out of both title and dynamic allocations.
+    #[test]
+    fn view_heaps_keep_the_clamp_slot_null() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; heap clamp test not run");
+            return;
+        };
+        probe_view_limit();
+        let null = victory_shader::emit::view_heap_limit();
+        assert!(null >= DYNAMIC);
+        for count in [4, null - DYNAMIC, null - DYNAMIC + 1, null + 1] {
+            let heap = HostHeap::new(false, count).expect("a view heap on the live device");
+            // SAFETY: a plain query of a live heap.
+            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, null + 1);
+            assert_eq!(heap.dynamic, DYNAMIC);
+            assert!(heap.count + heap.dynamic <= null);
+            let first = heap.dynamic(DYNAMIC).expect("the whole dynamic range");
+            assert!(first + DYNAMIC - 1 < null);
+            assert_eq!(heap.dynamic(1), None);
+        }
+        // SAFETY: a plain query of the live device after the allocations.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        eprintln!("heap clamp checked on hardware: {} slots, {DYNAMIC} dynamic slots; small, exact-fit and overflowing title heaps leave slot {null} null", null + 1);
     }
 
     #[test]

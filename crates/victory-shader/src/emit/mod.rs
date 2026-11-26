@@ -149,6 +149,27 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+thread_local! {
+    /// The loop limit of the translation running on this thread, if its
+    /// caller named one ([`with_loop_limit`]).
+    static LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) with every loop of it stopped after `limit`
+/// iterations per entry, whatever the stage, where `limit` is given; else
+/// with [`loop_limit`]'s. The caller keys its cache of translations on it.
+pub fn with_loop_limit<R>(limit: Option<u32>, f: impl FnOnce() -> R) -> R {
+    let was = LIMIT_HERE.with(|l| l.replace(limit));
+    let out = f();
+    LIMIT_HERE.with(|l| l.set(was));
+    out
+}
+
+/// The loop limit the translation on this thread uses ([`with_loop_limit`]).
+pub(crate) fn loop_limit_here() -> u32 {
+    LIMIT_HERE.with(std::cell::Cell::get).unwrap_or_else(loop_limit)
+}
+
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
 /// the shader cache keys on it.
@@ -164,7 +185,10 @@ pub fn helper_own() -> bool {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset or `auto`: on hosts narrower than the console wave, the title's
+///   divergent barriers retain their memory fences but do not wait. Other
+///   hosts and uniform barriers keep their group sync.
+/// - `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -176,12 +200,26 @@ pub fn helper_own() -> bool {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
-        _ => 2,
-    })
+        Some("2") => 2,
+        _ => 3,
+    }
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -1094,6 +1132,16 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    #[test]
+    fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
+        for value in [None, Some("auto"), Some(""), Some("invalid")] {
+            assert_eq!(super::parse_group_sync(value), 3);
+        }
+        for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
+            assert_eq!(super::parse_group_sync(Some(value)), mode);
+        }
     }
 
     #[test]
@@ -2974,5 +3022,20 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A loop limit named for one translation holds on its thread for that
+    /// translation only, and comes back to the stage limits after it.
+    #[test]
+    fn a_named_loop_limit_holds_for_its_translation_only() {
+        let normal = super::loop_limit_here();
+        assert_eq!(super::with_loop_limit(Some(512), super::loop_limit_here), 512);
+        assert_eq!(super::with_loop_limit(None, super::loop_limit_here), normal);
+        assert_eq!(super::with_loop_limit(Some(7), || super::with_loop_limit(Some(9), super::loop_limit_here)), 9);
+        assert_eq!(super::loop_limit_here(), normal);
+        // Another thread is not told.
+        super::with_loop_limit(Some(33), || {
+            assert_eq!(std::thread::spawn(super::loop_limit_here).join().unwrap(), normal);
+        });
     }
 }

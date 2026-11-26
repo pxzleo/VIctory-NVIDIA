@@ -69,6 +69,8 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1294,6 +1296,29 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass wrote its depth and motion
+/// for every pixel of a window pane, the character standing in front of it
+/// too, and a later pass copied those over the character's. Not for a
+/// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
+/// an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1383,6 +1408,30 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// The title's barrier retains its memory fences even when group sync
+/// would wait for a host wave that never visits it. Explicit overrides
+/// keep their old meanings; automatic mode is a targeted compatibility
+/// workaround for narrow-wave hosts and is restricted to single-console-wave
+/// groups (`group_threads <= console_wave`), so multi-console-wave groups
+/// never lose cross-wave synchronization.
+fn barrier_mode(
+    setting: u8,
+    host_wave: u32,
+    console_wave: u32,
+    group_threads: Option<u32>,
+    divergent: bool,
+    writes_uavs: bool,
+) -> u32 {
+    let single_console_wave = group_threads.is_some_and(|t| t <= console_wave);
+    let waits = match setting {
+        0 => false,
+        1 => !divergent,
+        2 => true,
+        _ => !(host_wave != 0 && host_wave < console_wave && single_console_wave && divergent),
+    };
+    8 | if writes_uavs { 2 } else { 0 } | u32::from(waits)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1399,6 +1448,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2453,6 +2505,8 @@ impl<'a> Lower<'a> {
             half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -5354,17 +5408,17 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
-                }
+                let setting = super::group_sync();
+                let divergent = self.fence_only.contains(&b);
+                let group_threads = self.s.threads.map(|t| t.iter().product());
+                let mode = barrier_mode(
+                    setting,
+                    host_max_wave(),
+                    self.wave(),
+                    group_threads,
+                    divergent,
+                    self.writes_uavs,
+                );
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -12661,7 +12715,7 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        let limit = match super::loop_limit_here() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,
@@ -12882,6 +12936,84 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
+        for writes in [false, true] {
+            let fence = 8 | if writes { 2 } else { 0 };
+            for (host, console, threads, divergent, waits) in [
+                (32, 64, Some(64), true, false),
+                (32, 64, Some(64), false, true),
+                (32, 64, Some(128), true, true),
+                (32, 64, None, true, true),
+                (64, 64, Some(64), true, true),
+                (32, 32, Some(32), true, true),
+                (0, 64, Some(64), true, true),
+            ] {
+                assert_eq!(
+                    super::barrier_mode(3, host, console, threads, divergent, writes),
+                    fence | u32::from(waits),
+                );
+            }
+            assert_eq!(super::barrier_mode(0, 32, 64, Some(64), false, writes), fence);
+            assert_eq!(super::barrier_mode(1, 64, 64, Some(64), true, writes), fence);
+            assert_eq!(super::barrier_mode(1, 32, 64, Some(64), false, writes), fence | 1);
+            assert_eq!(super::barrier_mode(2, 32, 64, Some(64), true, writes), fence | 1);
+        }
+    }
+
+    #[test]
+    fn automatic_barrier_flags_reach_the_emitted_shader() {
+        let divergent = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ];
+        let mut divergent32 = divergent;
+        divergent32[1] = 0xBE8C_3C6A; // s_and_saveexec_b32 s12, vcc_lo
+        divergent32[4] = 0xBEFE_030C; // s_mov_b32 exec_lo, s12
+        for (body, wave64, threads, host, expected) in [
+            (&divergent[..], true, 64, 32, 8),
+            (&divergent[..], true, 128, 32, 9),
+            (&divergent[..], true, 64, 64, 9),
+            (&divergent32[..], false, 64, 32, 9),
+            (&[0xBF8A_0000][..], true, 64, 32, 9),
+        ] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [threads, 1, 1] }),
+                code: body.iter().copied().chain([S_ENDPGM])
+                    .flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).expect("IR");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+            let io = io::raise(&p, &native).expect("IO");
+            let old_wave = super::TEST_HOST_WAVE.replace(Some(host));
+            let old_mode = super::super::TEST_GROUP_SYNC.replace(Some(3));
+            let shader = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::TEST_HOST_WAVE.set(old_wave);
+            super::super::TEST_GROUP_SYNC.set(old_mode);
+            let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
+            assert_eq!(shader.barrier_modes, vec![expected]);
+        }
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

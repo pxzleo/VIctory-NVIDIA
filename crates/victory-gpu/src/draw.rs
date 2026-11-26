@@ -338,14 +338,14 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) -> first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
+    /// address; 0 for none) -> dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -771,7 +771,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of(part, parts);
+        let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
         slots.extend(changed);
         slots
     } else {
@@ -1021,7 +1021,7 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
-        for &h in handles {
+        for &h in handles.iter().take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize) {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -1082,17 +1082,19 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        host.output_views(|output| {
+            let rtvs: Vec<_> = views.iter().map(|(texture, desc)| output.rtv(*texture, desc.as_ref())).collect();
+            let dsv = dsv.map(|(texture, record)| output.dsv(texture, record.depth_desc().as_ref()));
+            // SAFETY: an open list; the views live through the call.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        });
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -2433,7 +2435,7 @@ impl State {
                 }
             };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
-            let resource = match placed.as_ref().or(view.as_ref()) {
+            let resource = match placed.as_ref().map(|p| &p.view).or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
                     at_once();
@@ -4220,7 +4222,7 @@ impl RecordHash {
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
+    let view = placed.as_ref().map_or(view, |p| &p.view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
@@ -4246,8 +4248,17 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            // Where every descriptor of the view shows that texture itself
+            // (`crate::resource::read_cast`), it is read as it is: no copy.
+            let cast = crate::resource::read_cast(*resource as This);
+            if let Some(source) = cast {
+                crate::list::ensure_state(list, source, SHADER_RESOURCE);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::AliasCast, 1);
+            }
+            let aliased = cast.is_some()
+                || crate::resource::alias_of(*resource as This)
+                    .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0

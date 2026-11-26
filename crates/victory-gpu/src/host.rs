@@ -32,10 +32,6 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
-const RTV_RING: u32 = 1024;
-
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -43,16 +39,9 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
-    rtv_size: u32,
-    /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
-    dsv_size: u32,
-    next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
-    next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
@@ -937,20 +926,6 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -961,13 +936,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
-            rtvs,
-            rtv_size,
-            dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
             messages,
-            next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
         })
@@ -1151,6 +1120,117 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn another_worker_cannot_retarget_a_pending_clear() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; pending output clear test skipped");
+            return;
+        };
+        let make = |format, flags, state| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut texture = None;
+            // SAFETY: a valid texture description and a live output pointer.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut texture,
+                )
+            }.unwrap();
+            texture.unwrap()
+        };
+        let color = || make(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        let depth = || make(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        let [first_color, second_color] = [color(), color()];
+        let [first_depth, second_depth] = [depth(), depth()];
+        let list = host.new_list().unwrap();
+        for (color, depth) in [(&first_color, &first_depth), (&second_color, &second_depth)] {
+            host.output_views(|views| {
+                let rtv = views.rtv(Some(color), None);
+                let dsv = views.dsv(depth, None);
+                // SAFETY: the list is open and the textures are in their clear states.
+                unsafe {
+                    list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                    list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                }
+            });
+        }
+        host.output_views(|views| {
+            let rtv = views.rtv(Some(&first_color), None);
+            let dsv = views.dsv(&first_depth, None);
+            // Hold this worker between descriptor creation and recording while
+            // the other worker allocates an entire old process-wide ring.
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    for _ in 0..1024 {
+                        host.output_views(|views| {
+                            views.rtv(Some(&second_color), None);
+                            views.dsv(&second_depth, None);
+                        });
+                    }
+                }).join().unwrap();
+            });
+            // SAFETY: the list is open and both pairs of textures are still alive.
+            unsafe {
+                list.list.ClearRenderTargetView(rtv, &[1.0, 0.0, 0.0, 0.0], None);
+                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None);
+            }
+        });
+
+        let readback = host.read_back_buffer(2048).unwrap();
+        let textures = [
+            (&first_color, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            (&second_color, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            (&first_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            (&second_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        ];
+        for (i, (texture, before)) in textures.into_iter().enumerate() {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: an open list, live textures, and disjoint readback footprints.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &texture.GetDesc(), 0, 1, 512 * i as u64, Some(&mut footprint), None, None, None,
+                );
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                list.list.ResourceBarrier(&[transition(texture, before, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the GPU finished writing the 2048-byte readback buffer.
+        let pixels: [u32; 4] = unsafe {
+            readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 2048 }), Some(&mut mapped)).unwrap();
+            let values = std::array::from_fn(|i| mapped.cast::<u32>().add(128 * i).read());
+            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            values
+        };
+        assert_eq!(pixels, [255, 0, 0.25f32.to_bits(), 1.0f32.to_bits()], "pending clears reached the wrong textures");
+        eprintln!("both pending clears reached their own textures after 1024 descriptors on another recording thread");
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1557,7 +1637,6 @@ fn record_plane_pass(
                 },
                 ..Default::default()
             };
-            let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
             let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: pass.cpu + (slot * pass.step) as usize,
@@ -1574,7 +1653,10 @@ fn record_plane_pass(
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target));
+                host.output_views(|views| {
+                    let dsv = views.dsv(depth, Some(&target));
+                    list.OMSetRenderTargets(0, None, false, Some(&dsv));
+                });
                 list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
@@ -6056,39 +6138,95 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
-    pub(crate) fn rtv(
-        &self,
-        resource: Option<&ID3D12Resource>,
-        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource, or none with a
-        // description (a typed null view).
+    /// Prepare and record the CPU descriptors for one output-merger call or clear.
+    /// D3D12 copies these descriptors during recording. Each thread owns its
+    /// scratch heaps through the call, even if it is preempted before recording.
+    pub(crate) fn output_views(&self, record: impl FnOnce(&mut OutputViews<'_>)) {
+        thread_local! {
+            static HEAPS: std::cell::RefCell<Option<OutputHeaps>> = const { std::cell::RefCell::new(None) };
+        }
+        HEAPS.with(|heaps| {
+            let mut heaps = heaps.borrow_mut();
+            let heaps = heaps.get_or_insert_with(|| OutputHeaps {
+                colors: OutputHeap::new(
+                    &self.device,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                ),
+                depth: OutputHeap::new(&self.device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1),
+            });
+            record(&mut OutputViews { device: &self.device, heaps, next_rtv: 0, has_dsv: false });
+        });
+    }
+}
+
+struct OutputHeaps {
+    colors: OutputHeap,
+    depth: OutputHeap,
+}
+
+struct OutputHeap {
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+}
+
+impl OutputHeap {
+    fn new(device: &ID3D12Device, kind: D3D12_DESCRIPTOR_HEAP_TYPE, slots: u32) -> Self {
+        // SAFETY: a CPU-only heap description and a live device.
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
-            self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: slots,
+                ..Default::default()
+            }).unwrap_or_else(|e| fail(format_args!("output descriptor heap: {e}")));
+            Self {
+                start: heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                step: device.GetDescriptorHandleIncrementSize(kind) as usize,
+                _heap: heap,
+            }
         }
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    fn slot(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + index as usize * self.step }
+    }
+}
+
+pub(crate) struct OutputViews<'a> {
+    device: &'a ID3D12Device,
+    heaps: &'a OutputHeaps,
+    next_rtv: u32,
+    has_dsv: bool,
+}
+
+impl OutputViews<'_> {
+    /// A host render target view, valid within the recording scope.
+    pub(crate) fn rtv(
+        &mut self,
+        resource: Option<&ID3D12Resource>,
+        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        assert!(self.next_rtv < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+        let slot = self.heaps.colors.slot(self.next_rtv);
+        self.next_rtv += 1;
+        // SAFETY: this thread owns the slot and the resource is live, or the
+        // description supplies the type of a null view.
+        unsafe { self.device.CreateRenderTargetView(resource, desc.map(std::ptr::from_ref), slot) };
+        slot
+    }
+
+    /// A host depth view, valid within the recording scope.
     pub(crate) fn dsv(
-        &self,
+        &mut self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
-        unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
-            self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
-        }
+        assert!(!std::mem::replace(&mut self.has_dsv, true));
+        let slot = self.heaps.depth.slot(0);
+        // SAFETY: this thread owns the slot and the resource is live.
+        unsafe { self.device.CreateDepthStencilView(resource, desc.map(std::ptr::from_ref), slot) };
+        slot
     }
 }
 
