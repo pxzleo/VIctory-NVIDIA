@@ -226,14 +226,17 @@ impl MenuArt {
     }
 }
 
-const BUTTON_GAP: i32 = 6;
-
 fn original_button_radius(rect: RECT) -> i32 {
     (rect.right.min(rect.bottom) / 16).clamp(10, 64)
 }
 
 fn action_radius(rect: RECT) -> i32 {
-    (original_button_radius(rect) * 6 + 2) / 5
+    let previous = (original_button_radius(rect) * 6 + 2) / 5;
+    (previous * 85 + 50) / 100
+}
+
+fn action_gap(rect: RECT) -> i32 {
+    6 + (rect.right.min(rect.bottom) / 54).clamp(4, 16)
 }
 
 fn action_diagonal(reach: i32) -> i32 {
@@ -243,19 +246,20 @@ fn action_diagonal(reach: i32) -> i32 {
 fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -> Pose {
     let previous = (rect.right.min(rect.bottom) / 17).clamp(32, 76) * 3 / 2;
     let button = action_radius(rect);
+    let gap = action_gap(rect);
     let vertical_room = rect.bottom - 2 * button - 5;
     let max_reach = (vertical_room as f32 / (1.0 + std::f32::consts::FRAC_1_SQRT_2)) as i32;
     let radius = ((previous * 3 + 1) / 2)
         .min((rect.right - 4 * button - 16) / 3)
-        .min((rect.right - 2 * button - 14) / 4)
-        .min(max_reach - button - BUTTON_GAP);
+        .min((rect.right - 2 * button - gap - 8) / 4)
+        .min(max_reach - button - gap);
     let inset = radius + 2;
     let mut fallback = POINT {
         x: rect.right * [18, 82][index] / 100,
         y: rect.bottom * 73 / 100,
     };
     if index == 1 {
-        let reach = radius + button + BUTTON_GAP;
+        let reach = radius + button + gap;
         let far_edge = button + reach + 2;
         let bottom = rect.bottom - button - action_diagonal(reach) - 2;
         fallback.x = fallback.x.clamp(far_edge, rect.right - inset);
@@ -302,7 +306,7 @@ fn primary_pose(rect: RECT, action: Action) -> Pose {
     } else {
         let stick = pose(rect, POINT::default(), 1, None);
         let radius = action_radius(rect);
-        let reach = stick.radius + radius + BUTTON_GAP;
+        let reach = stick.radius + radius + action_gap(rect);
         let offset = action_diagonal(reach);
         let (x, y) = match action {
             Action::Lt => (-offset, offset),
@@ -731,7 +735,8 @@ mod tests {
         assert!(button_at(rect, x) == Some(Action::X));
         assert!(menu_covers(rect, blank) && button_at(rect, blank).is_none());
         toggle_more();
-        assert_eq!(primary_pose(rect, Action::Rt).radius, 40);
+        assert_eq!(primary_pose(rect, Action::Rt).radius, 34);
+        assert_eq!(action_gap(rect), 16);
         assert!((175..255).contains(&(paint_pixel(pose, 0, 0) >> 24)));
     }
 
@@ -782,12 +787,13 @@ mod tests {
             for (i, &action) in PRIMARY.iter().enumerate() {
                 let pad = primary_pose(rect, action);
                 let old = (width.min(height) / 16).clamp(10, 64);
+                let previous = (old * 6 + 2) / 5;
                 assert_eq!(
                     pad.radius,
                     if action == Action::More {
                         old
                     } else {
-                        (old * 6 + 2) / 5
+                        (previous * 85 + 50) / 100
                     }
                 );
                 assert!((pad.radius..=width - pad.radius).contains(&pad.center.0));
@@ -795,6 +801,9 @@ mod tests {
                 let (dx, dy) = (pad.center.0 - stick.center.0, pad.center.1 - stick.center.1);
                 assert!(dx * dx + dy * dy >= (stick.radius + pad.radius).pow(2));
                 if action != Action::More {
+                    assert!(
+                        dx * dx + dy * dy >= (stick.radius + pad.radius + action_gap(rect)).pow(2)
+                    );
                     let direction = match action {
                         Action::Lt => (-1, 1),
                         Action::Rt => (-1, 0),
