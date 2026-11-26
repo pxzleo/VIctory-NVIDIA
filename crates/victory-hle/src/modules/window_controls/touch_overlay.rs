@@ -1,4 +1,4 @@
-//! Two small desktop-composited controls. They never render into the swap chain.
+//! Desktop-composited touch controls and frame rate. They never render into the swap chain.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -21,6 +21,7 @@ pub(super) const REFRESH_TIMER: usize = 0x64a4;
 
 thread_local! {
     static OVERLAY: RefCell<Option<(HWND, Vec<Pad>)>> = const { RefCell::new(None) };
+    static FPS: RefCell<Option<(HWND, Pad)>> = const { RefCell::new(None) };
     static MORE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -67,9 +68,9 @@ fn enabled() -> Option<bool> {
     )
 }
 
-pub(super) fn start_for_touchscreen(hwnd: HWND) {
+pub(super) fn start(hwnd: HWND) {
     // SAFETY: this is a live window just hooked on the calling thread.
-    if enabled() == Some(true) && unsafe { wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) } == hwnd {
+    if unsafe { wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) } == hwnd {
         watch_foreground(hwnd);
     }
 }
@@ -79,8 +80,19 @@ fn watch_foreground(hwnd: HWND) {
     // thread's active window. Recheck visibility even when no focus message arrives.
     // SAFETY: the timer posts to the owner until that window is destroyed.
     if unsafe { wm::SetTimer(hwnd, REFRESH_TIMER, 250, None) } == 0 {
-        tracing::warn!(error = %io::Error::last_os_error(), "could not watch touch control visibility");
+        tracing::warn!(error = %io::Error::last_os_error(), "could not watch game overlay visibility");
     }
+}
+
+pub(super) fn refresh_fps(owner: HWND) {
+    FPS.with(|state| {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            if let Err(error) = update_fps(&mut state, owner) {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| tracing::warn!(%error, "could not display frame rate"));
+            }
+        }
+    });
 }
 
 pub(super) fn refresh(owner: HWND, drags: Drags, pressed: u32) {
@@ -98,6 +110,46 @@ pub(super) fn refresh(owner: HWND, drags: Drags, pressed: u32) {
     });
 }
 
+fn active_window(owner: HWND) -> bool {
+    // SAFETY: plain queries for the title window.
+    unsafe {
+        wm::GetForegroundWindow() == owner
+            && wm::IsWindowVisible(owner) != 0
+            && wm::IsIconic(owner) == 0
+    }
+}
+
+fn update_fps(state: &mut Option<(HWND, Pad)>, owner: HWND) -> io::Result<()> {
+    let Some(fps) = victory_gpu::frame::presented_fps() else { return Ok(()) };
+    if !active_window(owner) {
+        if let Some((_, pad)) = state.as_mut().filter(|(hwnd, _)| *hwnd == owner) {
+            pad.hide();
+        }
+        return Ok(());
+    }
+    let mut rect = RECT::default();
+    let mut origin = POINT::default();
+    // SAFETY: the client rectangle and origin have writable storage.
+    if unsafe { wm::GetClientRect(owner, &mut rect) } == 0
+        || unsafe { ClientToScreen(owner, &mut origin) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if state.as_ref().is_none_or(|(hwnd, _)| *hwnd != owner) {
+        *state = Some((owner, Pad::new(owner)?));
+    }
+    let scale = (rect.right.min(rect.bottom) / 430).clamp(2, 6);
+    state.as_mut().unwrap().1.show(Pose {
+        center: (origin.x, origin.y),
+        thumb: (0, 0),
+        radius: scale,
+        active: false,
+        button: None,
+        menu: None,
+        fps: Some(fps),
+    })
+}
+
 fn update(
     state: &mut Option<(HWND, Vec<Pad>)>,
     owner: HWND,
@@ -105,13 +157,7 @@ fn update(
     pressed: u32,
 ) -> io::Result<()> {
     let existing = state.as_ref().is_some_and(|(window, _)| *window == owner);
-    // SAFETY: the caller owns this live title window.
-    let active = unsafe {
-        wm::GetForegroundWindow() == owner
-            && wm::IsWindowVisible(owner) != 0
-            && wm::IsIconic(owner) == 0
-    };
-    if !active {
+    if !active_window(owner) {
         if existing {
             for pad in &mut state.as_mut().unwrap().1 {
                 pad.hide();
@@ -143,9 +189,6 @@ fn update(
             .map(|_| Pad::new(owner))
             .collect::<io::Result<_>>()?;
         *state = Some((owner, pads));
-        if enabled().is_none() {
-            watch_foreground(owner);
-        }
     }
     let (sticks, controls) = state.as_mut().unwrap().1.split_at_mut(2);
     let (menu, buttons) = controls.split_last_mut().unwrap();
@@ -181,6 +224,13 @@ fn update(
 }
 
 pub(super) fn forget(hwnd: HWND) {
+    FPS.with(|state| {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            if state.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
+                *state = None;
+            }
+        }
+    });
     OVERLAY.with(|state| {
         let mut state = state.borrow_mut();
         if state.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
@@ -191,6 +241,13 @@ pub(super) fn forget(hwnd: HWND) {
 }
 
 pub(super) fn hide(hwnd: HWND) {
+    FPS.with(|state| {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            if let Some((_, pad)) = state.as_mut().filter(|(owner, _)| *owner == hwnd) {
+                pad.hide();
+            }
+        }
+    });
     OVERLAY.with(|state| {
         if let Ok(mut state) = state.try_borrow_mut() {
             if let Some((_, pads)) = state.as_mut().filter(|(owner, _)| *owner == hwnd) {
@@ -210,6 +267,7 @@ struct Pose {
     active: bool,
     button: Option<Action>,
     menu: Option<MenuArt>,
+    fps: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -291,6 +349,7 @@ fn pose(rect: RECT, origin: POINT, index: usize, drag: Option<(POINT, POINT)>) -
         active: drag.is_some(),
         button: None,
         menu: None,
+        fps: None,
     }
 }
 
@@ -304,6 +363,7 @@ fn menu_pose(rect: RECT, pressed: u32) -> Pose {
         active: false,
         button: None,
         menu: Some(MenuArt { cell, pressed }),
+        fps: None,
     }
 }
 
@@ -343,6 +403,7 @@ fn primary_pose(rect: RECT, action: Action) -> Pose {
         active: false,
         button: Some(action),
         menu: None,
+        fps: None,
     }
 }
 
@@ -454,11 +515,14 @@ impl Pad {
         }
         let (x, y) = pose.center;
         let edge = pose.radius + 1;
-        let size = 2 * edge + 1;
-        let at = POINT {
-            x: x - edge,
-            y: y - edge,
+        let (at, shape) = if let Some(fps) = pose.fps {
+            let characters = fps.max(1).ilog10() as i32 + 5;
+            let columns = 49.max(4 * characters + 6);
+            (POINT { x, y }, [columns * pose.radius, 9 * pose.radius])
+        } else {
+            (POINT { x: x - edge, y: y - edge }, [2 * edge + 1; 2])
         };
+        let [width, height] = shape;
         if self.shown.is_some_and(|last| {
             Pose {
                 center: pose.center,
@@ -483,8 +547,8 @@ impl Pad {
             self.shown = Some(pose);
             return Ok(());
         }
-        if self.dib.as_ref().is_none_or(|dib| dib.size != size) {
-            self.dib = Some(Bitmap::new(size)?);
+        if self.dib.as_ref().is_none_or(|dib| dib.shape != shape) {
+            self.dib = Some(Bitmap::new(shape)?);
         }
         let dib = self.dib.as_mut().unwrap();
         dib.paint(pose);
@@ -500,7 +564,7 @@ impl Pad {
                 self.window,
                 null_mut(),
                 &at,
-                &SIZE { cx: size, cy: size },
+                &SIZE { cx: width, cy: height },
                 dib.dc,
                 &POINT::default(),
                 0,
@@ -534,16 +598,17 @@ struct Bitmap {
     handle: HBITMAP,
     previous: HGDIOBJ,
     bits: *mut u32,
-    size: i32,
+    shape: [i32; 2],
 }
 
 impl Bitmap {
-    fn new(size: i32) -> io::Result<Self> {
+    fn new(shape: [i32; 2]) -> io::Result<Self> {
+        let [width, height] = shape;
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size,
+                biWidth: width,
+                biHeight: -height,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB,
@@ -562,7 +627,7 @@ impl Bitmap {
                 handle: null_mut(),
                 previous: null_mut(),
                 bits: null_mut(),
-                size,
+                shape,
             };
             let mut bits = null_mut();
             bitmap.handle = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
@@ -579,14 +644,16 @@ impl Bitmap {
     }
 
     fn paint(&mut self, pose: Pose) {
-        // SAFETY: the private top-down 32-bit DIB has size * size pixels.
-        let pixels =
-            unsafe { std::slice::from_raw_parts_mut(self.bits, (self.size * self.size) as usize) };
+        let [width, height] = self.shape;
+        // SAFETY: the private top-down 32-bit DIB has width * height pixels.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(self.bits, (width * height) as usize) };
+        if let Some(fps) = pose.fps {
+            paint_fps(pixels, width as usize, pose.radius as usize, fps);
+            return;
+        }
         for (i, pixel) in pixels.iter_mut().enumerate() {
-            let (x, y) = (
-                i as i32 % self.size - self.size / 2,
-                i as i32 / self.size - self.size / 2,
-            );
+            let x = i as i32 % width - width / 2;
+            let y = i as i32 / width - height / 2;
             *pixel = paint_pixel(pose, x, y);
         }
     }
@@ -648,7 +715,44 @@ fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
     let Some(&letter) = text.get((x / scale / 4) as usize) else {
         return false;
     };
-    let glyph = match letter {
+    glyph(letter)[(y / scale) as usize] & (4 >> column) != 0
+}
+
+fn paint_fps(pixels: &mut [u32], width: usize, scale: usize, fps: u32) {
+    pixels.fill(0xff10141c);
+    let text = format!("{fps} FPS");
+    for (index, byte) in text.bytes().enumerate() {
+        let left = (3 + 4 * index) * scale;
+        for (row, bits) in glyph(byte).into_iter().enumerate() {
+            for column in 0..3 {
+                if bits & (4 >> column) == 0 {
+                    continue;
+                }
+                let x = left + column * scale;
+                let y = (2 + row) * scale;
+                for line in y..y + scale {
+                    let offset = line * width + x;
+                    pixels[offset..offset + scale].fill(0xfff4f8ff);
+                }
+            }
+        }
+    }
+}
+
+fn glyph(letter: u8) -> [u8; 5] {
+    match letter {
+        b'0' => [7, 5, 5, 5, 7],
+        b'1' => [2, 6, 2, 2, 7],
+        b'2' => [7, 1, 7, 4, 7],
+        b'3' => [7, 1, 7, 1, 7],
+        b'4' => [5, 5, 7, 1, 1],
+        b'5' => [7, 4, 7, 1, 7],
+        b'6' => [7, 4, 7, 5, 7],
+        b'7' => [7, 1, 2, 2, 2],
+        b'8' => [7, 5, 7, 5, 7],
+        b'9' => [7, 5, 7, 1, 7],
+        b'P' => [7, 5, 7, 4, 4],
+        b' ' => [0; 5],
         b'A' => [2, 5, 7, 5, 5],
         b'B' => [6, 5, 6, 5, 6],
         b'E' => [7, 4, 6, 4, 7],
@@ -673,8 +777,7 @@ fn label(action: Action, radius: i32, x: i32, y: i32) -> bool {
         b'.' => [0, 0, 0, 0, 2],
         b'-' => [0, 0, 7, 0, 0],
         _ => [7, 0, 7, 0, 7],
-    };
-    glyph[(y / scale) as usize] & (4 >> column) != 0
+    }
 }
 
 fn paint_pixel(pose: Pose, x: i32, y: i32) -> u32 {
@@ -700,6 +803,7 @@ fn paint_pixel(pose: Pose, x: i32, y: i32) -> u32 {
                 active: action.in_mask(menu.pressed),
                 button: Some(action),
                 menu: None,
+                fps: None,
             },
             dx,
             dy,

@@ -11,7 +11,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -34,6 +34,18 @@ struct Clock {
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
+static PRESENTED_FPS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The last completed present-rate sample shown in the game's window title.
+pub fn presented_fps() -> Option<u32> {
+    let fps = PRESENTED_FPS.load(Ordering::Relaxed);
+    (fps != u32::MAX).then_some(fps)
+}
+
+#[cfg(windows)]
+pub(crate) fn report_presented_fps(fps: u32) {
+    PRESENTED_FPS.store(fps, Ordering::Relaxed);
+}
 
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())

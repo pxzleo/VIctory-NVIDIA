@@ -30,7 +30,7 @@ const START_FULLSCREEN: u32 = wm::WM_APP + 0x4a3;
 const MOUSE_CONTACT: u32 = u32::MAX;
 const MOUSE_LEFT_DOWN: WPARAM = 1; // MK_LBUTTON
 pub(super) fn hook_installed(hwnd: HWND) {
-    touch_overlay::start_for_touchscreen(hwnd);
+    touch_overlay::start(hwnd);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -592,6 +592,7 @@ pub(super) fn message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) 
         | wm::WM_WINDOWPOSCHANGED
         | wm::WM_SIZE => refresh_pads(hwnd),
         wm::WM_TIMER if wparam == touch_overlay::REFRESH_TIMER => {
+            touch_overlay::refresh_fps(hwnd);
             refresh_pads(hwnd);
             return Some(0);
         }
