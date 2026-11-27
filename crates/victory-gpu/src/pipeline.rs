@@ -418,6 +418,8 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    skipped_shader: OnceLock<Option<usize>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -513,10 +515,14 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    let find = || p.shaders.iter().position(|shader| hashes.contains(&shader.hash));
+    // The shader list and skip set are immutable for the lifetime of a pipeline.
+    let index = if crate::toggled!("VICTORY_CACHE_SKIP_SHADER") {
+        *p.skipped_shader.get_or_init(find)
+    } else {
+        find()
+    };
+    index.map(|i| p.shaders[i].hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -600,6 +606,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(all(windows, feature = "diagnostics"))]
+        skipped_shader: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

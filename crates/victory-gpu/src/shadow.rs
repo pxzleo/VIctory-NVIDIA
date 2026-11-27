@@ -25,6 +25,374 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
+/// Per-page last copied write-watch sequence, paired with a 64-page-per-word
+/// bitmask of uncopied pages so partially-initialized buffers and windows
+/// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
+/// initialized regions 64 pages at a time when uncopied pages exist.
+struct CopiedPages {
+    at: Vec<u64>,
+    /// Bit `i` (word `i / 64`, bit `i % 64`) is 1 iff `at[i] == 0`.
+    /// Unused high bits in the final word are always 0.
+    uncopied_bits: Vec<u64>,
+    uncopied: usize,
+    /// The last and longest ranges copied whole, and their asking numbers.
+    ranged: [(usize, usize, u64); 2],
+}
+
+impl CopiedPages {
+    fn new(pages: usize) -> Self {
+        let words = pages.div_ceil(64);
+        let mut uncopied_bits = vec![u64::MAX; words];
+        let rem = pages % 64;
+        if rem != 0 {
+            uncopied_bits[words - 1] = (1u64 << rem) - 1;
+        }
+        Self {
+            at: vec![0; pages],
+            uncopied_bits,
+            uncopied: pages,
+            ranged: [(0, 0, 0); 2],
+        }
+    }
+
+    fn set(&mut self, index: usize, now: u64) {
+        if let Some(slot) = self.at.get_mut(index) {
+            if *slot == 0 && now != 0 {
+                self.uncopied -= 1;
+                self.uncopied_bits[index / 64] &= !(1u64 << (index % 64));
+            } else if *slot != 0 && now == 0 {
+                self.uncopied += 1;
+                self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
+            }
+            *slot = now;
+        }
+    }
+
+    #[cfg(test)]
+    fn all_copied(&self) -> bool {
+        self.uncopied == 0
+    }
+
+    /// Whether every page index in `lo..=hi` has been copied whole at least once.
+    fn range_all_copied(&self, lo: usize, hi: usize) -> bool {
+        if lo > hi || self.uncopied == 0 {
+            return true;
+        }
+        let first_w = lo / 64;
+        let last_w = hi / 64;
+        let lo_mask = u64::MAX << (lo % 64);
+        let hi_mask = u64::MAX >> (63 - (hi % 64));
+        if first_w == last_w {
+            return (self.uncopied_bits[first_w] & lo_mask & hi_mask) == 0;
+        }
+        if (self.uncopied_bits[first_w] & lo_mask) != 0 {
+            return false;
+        }
+        for &word in &self.uncopied_bits[first_w + 1..last_w] {
+            if word != 0 {
+                return false;
+            }
+        }
+        (self.uncopied_bits[last_w] & hi_mask) == 0
+    }
+
+    /// Lowest page index `>= from_idx` and `<= hi` that has never been copied whole.
+    fn next_uncopied(&self, from_idx: usize, hi: usize) -> Option<usize> {
+        if from_idx > hi || self.uncopied == 0 {
+            return None;
+        }
+        let mut w = from_idx / 64;
+        let last_w = hi / 64;
+        let mut word = self.uncopied_bits[w] & (u64::MAX << (from_idx % 64));
+        loop {
+            if w == last_w {
+                word &= u64::MAX >> (63 - (hi % 64));
+            }
+            if word != 0 {
+                return Some(w * 64 + word.trailing_zeros() as usize);
+            }
+            if w == last_w {
+                return None;
+            }
+            w += 1;
+            word = self.uncopied_bits[w];
+        }
+    }
+
+    /// The latest completed asking whose copied range covers this one.
+    fn ranged(&self, from: usize, to: usize) -> u64 {
+        self.ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
+    }
+
+    fn written_start(written: &[(usize, u64)], first_page: usize) -> usize {
+        if written.len() > 8 {
+            written.partition_point(|&(p, _)| p < first_page)
+        } else {
+            let mut i = 0;
+            while i < written.len() && written[i].0 < first_page {
+                i += 1;
+            }
+            i
+        }
+    }
+
+    /// Plans the coalesced byte runs `(run_from, run_to, known)` inside
+    /// `[from, to)` that must be copied from title memory, together with
+    /// `(page, taken)` for pages taken before and written since, while updating
+    /// whole-page copied timestamps while the caller holds the copy state lock.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        ranged: u64,
+        written: &[(usize, u64)],
+    ) -> (Vec<(usize, usize, bool)>, Vec<(usize, u64)>) {
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut again_at: Vec<(usize, u64)> = Vec::new();
+        if from >= to {
+            return (runs, again_at);
+        }
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let lo = first_page - base;
+        let hi = last - base;
+
+        let push_page = |runs: &mut Vec<(usize, usize, bool)>,
+                         run: &mut Option<(usize, usize, bool)>,
+                         page: usize,
+                         again: bool| {
+            match *run {
+                Some((_, run_end, _)) if page < run_end => {}
+                Some((run_start, run_end, known)) if page == run_end && known == again => {
+                    *run = Some((run_start, page + 1, known));
+                }
+                Some((run_start, run_end, known)) => {
+                    runs.push(((run_start * PAGE).max(from), (run_end * PAGE).min(to), known));
+                    *run = Some((page, page + 1, again));
+                }
+                None => *run = Some((page, page + 1, again)),
+            }
+        };
+
+        let mut run: Option<(usize, usize, bool)> = None;
+        let w_start = Self::written_start(written, first_page);
+
+        // Fast path: every page in `[from, to)` has been copied at least once
+        // (whole or via a covering `ranged` capture).
+        if ranged != 0 || self.range_all_copied(lo, hi) {
+            if w_start >= written.len() || written[w_start].0 > last {
+                return (runs, again_at);
+            }
+            for &(page, write) in &written[w_start..] {
+                if page > last {
+                    break;
+                }
+                let idx = page - base;
+                let taken = self.at[idx].max(ranged);
+                if write <= taken {
+                    continue;
+                }
+                if let Some((_, run_end, _)) = run
+                    && page < run_end
+                {
+                    continue;
+                }
+                // A page only partly in the range is copied in part: it stays
+                // stale for the rest.
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    self.set(idx, now);
+                }
+                again_at.push((page, taken));
+                push_page(&mut runs, &mut run, page, true);
+            }
+            if let Some((run_start, run_end, known)) = run {
+                runs.push(((run_start * PAGE).max(from), (run_end * PAGE).min(to), known));
+            }
+            return (runs, again_at);
+        }
+
+        // Sparse merge of uncopied pages (via 64-page bitmask) and dirty
+        // `written` entries in `[first_page, last]`, skipping already-clean
+        // initialized spans without touching `self.at`.
+        let mut wi = w_start;
+        let mut next_u = self.next_uncopied(lo, hi);
+        loop {
+            while wi < written.len() && written[wi].0 <= last {
+                let (wp, write) = written[wi];
+                let idx = wp - base;
+                if self.at[idx] == 0 || write > self.at[idx] {
+                    break;
+                }
+                wi += 1;
+            }
+            let next_w = (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
+            let (idx, taken) = match (next_u, next_w) {
+                (Some(u), Some(w)) if u < w => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    (u, 0)
+                }
+                (Some(u), Some(w)) if w < u => {
+                    let page = base + w;
+                    while wi < written.len() && written[wi].0 == page {
+                        wi += 1;
+                    }
+                    (w, self.at[w])
+                }
+                (Some(u), Some(_)) => {
+                    let page = base + u;
+                    next_u = self.next_uncopied(u + 1, hi);
+                    while wi < written.len() && written[wi].0 == page {
+                        wi += 1;
+                    }
+                    (u, 0)
+                }
+                (Some(u), None) => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    (u, 0)
+                }
+                (None, Some(w)) => {
+                    let page = base + w;
+                    while wi < written.len() && written[wi].0 == page {
+                        wi += 1;
+                    }
+                    (w, self.at[w])
+                }
+                (None, None) => break,
+            };
+            let page = base + idx;
+            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                self.set(idx, now);
+            }
+            let again = taken != 0;
+            if again {
+                again_at.push((page, taken));
+            }
+            push_page(&mut runs, &mut run, page, again);
+        }
+        // Cut to the range: next to it shaders may be writing the copy.
+        if let Some((run_start, run_end, known)) = run {
+            runs.push(((run_start * PAGE).max(from), (run_end * PAGE).min(to), known));
+        }
+        (runs, again_at)
+    }
+
+    /// Pages of `[a, e)` within this copy that were never taken or were written
+    /// after they were last taken, in ascending page order.
+    fn stale_pages_in(&self, base: usize, a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+        let mut out = Vec::new();
+        if a >= e {
+            return out;
+        }
+        let first = (a / PAGE).max(base);
+        let last_excl = e.div_ceil(PAGE).min(base.saturating_add(self.at.len()));
+        if first >= last_excl {
+            return out;
+        }
+        let last = last_excl - 1;
+        let lo = first - base;
+        let hi = last - base;
+        let w_start = Self::written_start(written, first);
+        if self.range_all_copied(lo, hi) {
+            for &(page, write) in &written[w_start..] {
+                if page > last {
+                    break;
+                }
+                if write > self.at[page - base] && out.last() != Some(&page) {
+                    out.push(page);
+                }
+            }
+            return out;
+        }
+        let mut wi = w_start;
+        let mut next_u = self.next_uncopied(lo, hi);
+        loop {
+            while wi < written.len() && written[wi].0 <= last {
+                let (wp, write) = written[wi];
+                let idx = wp - base;
+                if self.at[idx] == 0 || write > self.at[idx] {
+                    break;
+                }
+                wi += 1;
+            }
+            let next_w = (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
+            let idx = match (next_u, next_w) {
+                (Some(u), Some(w)) if u < w => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    u
+                }
+                (Some(u), Some(w)) if w < u => {
+                    let page = base + w;
+                    while wi < written.len() && written[wi].0 == page {
+                        wi += 1;
+                    }
+                    w
+                }
+                (Some(u), Some(_)) => {
+                    let page = base + u;
+                    next_u = self.next_uncopied(u + 1, hi);
+                    while wi < written.len() && written[wi].0 == page {
+                        wi += 1;
+                    }
+                    u
+                }
+                (Some(u), None) => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    u
+                }
+                (None, Some(w)) => {
+                    let page = base + w;
+                    while wi < written.len() && written[wi].0 == page {
+                        wi += 1;
+                    }
+                    w
+                }
+                (None, None) => break,
+            };
+            out.push(base + idx);
+        }
+        out
+    }
+
+    /// Allocation-free check for whether [`Self::stale_pages_in`] is non-empty.
+    fn has_stale_in(&self, base: usize, a: usize, e: usize, written: &[(usize, u64)]) -> bool {
+        if a >= e {
+            return false;
+        }
+        let first = (a / PAGE).max(base);
+        let last_excl = e.div_ceil(PAGE).min(base.saturating_add(self.at.len()));
+        if first >= last_excl {
+            return false;
+        }
+        let last = last_excl - 1;
+        let lo = first - base;
+        let hi = last - base;
+        if !self.range_all_copied(lo, hi) {
+            return true;
+        }
+        let w_start = Self::written_start(written, first);
+        for &(page, write) in &written[w_start..] {
+            if page > last {
+                break;
+            }
+            if write > self.at[page - base] {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn copied_count(&self) -> usize {
+        self.at.len() - self.uncopied
+    }
+}
+
+/// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
     /// each, that what shaders wrote was put into since a refresh last looked
@@ -42,12 +410,7 @@ pub(crate) struct Shadow {
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
-    /// Two ranges of title memory taken whole, the last one and the longest,
-    /// and the asking after which each was ([`Shadow::copy_stale`]). A page
-    /// a range holds in part cannot say so in `copied`. Locked inside
-    /// `copied`'s lock.
-    ranged: Mutex<[(usize, usize, u64); 2]>,
+    copied: Mutex<CopiedPages>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -667,7 +1030,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             continue;
         };
         let written: std::collections::HashMap<usize, u64> = written.into_iter().collect();
-        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).at.clone();
         for (i, &at) in copied.iter().enumerate() {
             let page = start / PAGE + i;
             if at == 0 || written.get(&page).is_some_and(|&w| w > at) {
@@ -2161,6 +2524,113 @@ unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// `held` is `title` afterwards.
+fn word_runs_put(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2, and the lengths are the same.
+        return unsafe { word_runs_put_avx2(at, title, held) };
+    }
+    let runs = dword_runs(at, title, held, 0);
+    for &(r, m) in &runs {
+        held[r..r + m].copy_from_slice(&title[r..r + m]);
+    }
+    runs
+}
+
+/// # Safety
+/// AVX2, and two slices of one length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn word_runs_put_avx2(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(title.len(), held.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((a, n)) if *a + *n == from => *n += len,
+        _ => runs.push((from, len)),
+    };
+    let n = title.len();
+    let prefix = ((4 - (at & 3)) & 3).min(n);
+    if prefix > 0 && title[..prefix] != held[..prefix] {
+        held[..prefix].copy_from_slice(&title[..prefix]);
+        push(0, prefix);
+    }
+    let aligned_end = prefix + ((n - prefix) & !3);
+    let mut i = prefix;
+    while i + 256 <= aligned_end {
+        let mut differ = 0u64;
+        for k in 0..8 {
+            let off = i + 32 * k;
+            // SAFETY: inside both slices (`i + 256 <= aligned_end <= n`).
+            unsafe {
+                let now = _mm256_loadu_si256(title.as_ptr().add(off).cast());
+                let old = _mm256_loadu_si256(held.as_ptr().add(off).cast());
+                let block = !_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(now, old))) as u8;
+                if block != 0 {
+                    _mm256_storeu_si256(held.as_mut_ptr().add(off).cast(), now);
+                }
+                differ |= u64::from(block) << (8 * k);
+            }
+        }
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + 4 * first as usize, 4 * count as usize);
+            if first + count >= 64 {
+                break;
+            }
+            differ &= u64::MAX << (first + count);
+        }
+        i += 256;
+    }
+    while i + 32 <= aligned_end {
+        // SAFETY: inside both slices (`i + 32 <= aligned_end <= n`).
+        let mut differ = unsafe {
+            let now = _mm256_loadu_si256(title.as_ptr().add(i).cast());
+            let old = _mm256_loadu_si256(held.as_ptr().add(i).cast());
+            let block = !_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(now, old))) as u8;
+            if block != 0 {
+                _mm256_storeu_si256(held.as_mut_ptr().add(i).cast(), now);
+            }
+            block
+        };
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + 4 * first as usize, 4 * count as usize);
+            if first + count >= 8 {
+                break;
+            }
+            differ &= u8::MAX << (first + count);
+        }
+        i += 32;
+    }
+    while i + 4 <= aligned_end {
+        if title[i..i + 4] != held[i..i + 4] {
+            held[i..i + 4].copy_from_slice(&title[i..i + 4]);
+            push(i, 4);
+        }
+        i += 4;
+    }
+    if aligned_end < n && title[aligned_end..n] != held[aligned_end..n] {
+        held[aligned_end..n].copy_from_slice(&title[aligned_end..n]);
+        push(aligned_end, n - aligned_end);
+    }
+    runs
+}
+
+/// Applies one page chunk of [`Shadow::take`]: copies changed dwords from
+/// `title` into `held` (or the whole slice when `whole`), returning the
+/// changed byte runs relative to `0..title.len()`.
+fn take_chunk(at: usize, title: &[u8], held: &mut [u8], whole: bool) -> Vec<(usize, usize)> {
+    if whole {
+        held.copy_from_slice(title);
+        return if title.is_empty() { Vec::new() } else { vec![(0, title.len())] };
+    }
+    word_runs_put(at, title, held)
+}
+
 /// Whether the pages of [`Shadow::merge_under_writes`] are compared on several
 /// threads (`VICTORY_UNDER_WIDE=0`: on the submitting one).
 fn under_wide() -> bool {
@@ -2597,6 +3067,7 @@ mod piece_tests {
 /// merged nor a reason to settle; the refresh leaves such ranges alone, and
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
+#[cfg(test)]
 fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
         .filter(|&page| page >= base)
@@ -2769,7 +3240,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.copied_count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -2967,8 +3438,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
-            ranged: Mutex::default(),
+            copied: Mutex::new(CopiedPages::new(pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3462,7 +3932,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => copied.has_stale_in(base, a, e, &written),
             None => true,
         })
     }
@@ -3523,7 +3993,7 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                copied.stale_pages_in(base, a, e, &written)
             };
             if stale.is_empty() {
                 continue;
@@ -3598,9 +4068,7 @@ impl Shadow {
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                    copied.set(page - base, now);
                 }
             }
             if over.into_inner() {
@@ -3730,7 +4198,13 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied.at, copied.ranged(from, to), |lo, hi| {
+            if crate::toggled!("VICTORY_FAST_EMPTY_REFRESH") {
+                copied.range_all_copied(lo, hi - 1)
+            } else {
+                copied.at[lo..hi].iter().all(|&at| at != 0)
+            }
+        });
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3738,13 +4212,6 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
-    }
-
-    /// The latest asking after which a range that holds `[from, to)` was
-    /// taken whole (0: none is known). The caller holds `copied`'s lock.
-    fn ranged(&self, from: usize, to: usize) -> u64 {
-        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3839,65 +4306,28 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let light = crate::watch::light();
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        // Pages the range holds in part are never noted in `copied`, and
-        // were copied again at every refresh of the range, written or not:
-        // of the heap's buffer views alone two ends for each of 4,400
-        // copies, every frame. A range that was taken whole, and not written
-        // since, is as it was.
-        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
-        let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
-        // Pages taken before and written since: in the order of their runs.
-        let mut again_at: Vec<(usize, u64)> = Vec::new();
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
-            if taken == 0 || write > taken {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                // Cut where pages taken before meet pages never taken.
-                let again = taken != 0;
-                if again {
-                    again_at.push((page, taken));
-                }
-                if let Some((first, known)) = run
-                    && known != again
-                {
-                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-                    run = None;
-                }
-                run.get_or_insert((page, again));
-            } else if let Some((first, known)) = run.take() {
-                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-            }
-        }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some((first, known)) = run {
-            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
-        }
-        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        // Pages held in part are copied on every refresh. Whole, unwritten
+        // pages and a range already covered by ranged can be left alone.
+        let ranged = if light { copied.ranged(from, to) } else { 0 };
+        let (runs, again_at) = copied.plan_stale(base, start, end, from, to, now, ranged, written);
+        let runs = if runs.is_empty() || again_at.is_empty() {
+            runs
+        } else {
+            by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
+        };
         let bytes = self.take_all(runs);
-        if crate::watch::light() {
-            // All of the range is in the copy as of this asking.
-            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+        if light {
+            // Publish the completed range with the copied pages still locked.
+            let ranged = &mut copied.ranged;
             ranged[0] = (from, to, now);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
             }
         }
+        drop(copied);
         bytes
     }
 
@@ -4041,9 +4471,8 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = take_chunk(at, title, held, whole);
                 for &(a, len) in &runs {
-                    held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
@@ -4547,12 +4976,12 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(&at) = copied.at.get(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        let held = at != 0 && at >= before && crate::watch::block_published(block);
         if held {
-            *at = (*at).max(now);
+            copied.set(page, at.max(now));
         }
         held
     }
@@ -5585,4 +6014,323 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod copied_and_take_tests {
+    use super::*;
+
+    fn assert_copied_invariants(cp: &CopiedPages, oracle: &[u64]) {
+        assert_eq!(cp.at, oracle);
+        let expected_uncopied = oracle.iter().filter(|&&v| v == 0).count();
+        assert_eq!(cp.uncopied, expected_uncopied);
+        assert_eq!(cp.all_copied(), expected_uncopied == 0);
+        assert_eq!(cp.copied_count(), oracle.len() - expected_uncopied);
+        for (i, &val) in oracle.iter().enumerate() {
+            let bit = (cp.uncopied_bits[i / 64] >> (i % 64)) & 1;
+            assert_eq!(bit == 1, val == 0, "bitmask mismatch at page {i}");
+        }
+        if let Some(&last_word) = cp.uncopied_bits.last() {
+            let rem = oracle.len() % 64;
+            if rem != 0 {
+                assert_eq!(last_word >> rem, 0, "unused high bits must stay zero");
+            }
+        }
+    }
+
+    #[test]
+    fn copied_pages_bitmask_matches_dense_oracle_across_word_boundaries() {
+        for pages in [0usize, 1, 63, 64, 65, 127, 128, 129, 257] {
+            let mut cp = CopiedPages::new(pages);
+            let mut oracle = vec![0u64; pages];
+            assert_copied_invariants(&cp, &oracle);
+
+            // Out-of-bounds set is a no-op.
+            cp.set(pages, 42);
+            cp.set(pages.saturating_add(100), 99);
+            assert_copied_invariants(&cp, &oracle);
+
+            // Mark selected pages copied across 64-page word boundaries.
+            for idx in 0..pages {
+                if idx % 3 != 0 || idx % 64 == 0 || idx % 64 == 63 {
+                    let seq = (idx as u64 % 7) + 1;
+                    cp.set(idx, seq);
+                    oracle[idx] = seq;
+                }
+            }
+            assert_copied_invariants(&cp, &oracle);
+
+            // Reset a subset back to 0 and update existing non-zero entries.
+            for idx in (0..pages).step_by(11) {
+                cp.set(idx, 0);
+                oracle[idx] = 0;
+            }
+            for idx in (1..pages).step_by(13) {
+                let seq = 100 + idx as u64;
+                cp.set(idx, seq);
+                oracle[idx] = seq;
+            }
+            assert_copied_invariants(&cp, &oracle);
+
+            // Compare `range_all_copied` and `next_uncopied` against dense scans.
+            let probes: Vec<usize> = [0, 1, 2, 62, 63, 64, 65, 126, 127, 128, 129, pages.saturating_sub(1)]
+                .into_iter()
+                .filter(|&i| i < pages)
+                .collect();
+            for &lo in &probes {
+                for &hi in &probes {
+                    if lo > hi {
+                        continue;
+                    }
+                    let expected_all = oracle[lo..=hi].iter().all(|&v| v != 0);
+                    assert_eq!(cp.range_all_copied(lo, hi), expected_all, "pages={pages} {lo}..={hi}");
+                    let expected_next = (lo..=hi).find(|&i| oracle[i] == 0);
+                    assert_eq!(cp.next_uncopied(lo, hi), expected_next, "pages={pages} {lo}..={hi}");
+                }
+            }
+
+            // Fill remaining pages and confirm fast-path completion.
+            for idx in 0..pages {
+                cp.set(idx, 500 + idx as u64);
+                oracle[idx] = 500 + idx as u64;
+            }
+            assert_copied_invariants(&cp, &oracle);
+            if pages > 0 {
+                assert!(cp.range_all_copied(0, pages - 1));
+                assert_eq!(cp.next_uncopied(0, pages - 1), None);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_oracle(
+        oracle: &mut [u64],
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        ranged: u64,
+        written: &[(usize, u64)],
+    ) -> (Vec<(usize, usize, bool)>, Vec<(usize, u64)>) {
+        let mut runs = Vec::new();
+        let mut again_at = Vec::new();
+        if from >= to {
+            return (runs, again_at);
+        }
+        let mut run: Option<(usize, bool)> = None;
+        let last = (to - 1) / PAGE;
+        for page in from / PAGE..=last {
+            let write = written
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .map_or(0, |i| written[i].1);
+            let at = &mut oracle[page - base];
+            let taken = (*at).max(ranged);
+            if taken == 0 || write > taken {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                let again = taken != 0;
+                if again {
+                    again_at.push((page, taken));
+                }
+                if let Some((first, known)) = run
+                    && known != again
+                {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                    run = None;
+                }
+                run.get_or_insert((page, again));
+            } else if let Some((first, known)) = run.take() {
+                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+            }
+        }
+        if let Some((first, known)) = run {
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+        }
+        (runs, again_at)
+    }
+
+    #[test]
+    fn plan_stale_matches_dense_oracle_with_ranged_and_partial_init() {
+        const PAGES: usize = 160;
+        let base = 0x400usize;
+        let start = base * PAGE + 123;
+        let end = (base + PAGES) * PAGE - 77;
+
+        let mut oracle = vec![0u64; PAGES];
+        let mut fast = CopiedPages::new(PAGES);
+
+        // Partial initialization spanning 64-page word boundaries.
+        for idx in (0..PAGES).filter(|i| i % 3 != 0 || *i == 63 || *i == 64 || *i == 127 || *i == 128) {
+            let seq = (idx as u64 % 5) + 1;
+            oracle[idx] = seq;
+            fast.set(idx, seq);
+        }
+
+        let written = [
+            (base - 2, 99),
+            (base + 1, 10),
+            (base + 2, 10),
+            (base + 63, 2),
+            (base + 64, 12),
+            (base + 65, 12),
+            (base + 66, 12),
+            (base + 127, 15),
+            (base + 128, 1),
+            (base + 159, 20),
+            (base + PAGES + 5, 99),
+        ];
+
+        // Mix unaligned ranges, partial pages, `ranged == 0`, and `ranged > 0`.
+        let queries = [
+            (start, start + 16, 0u64),
+            (start, start + 16, 5u64),
+            (start, (base + 4) * PAGE, 0u64),
+            ((base + 62) * PAGE + 10, (base + 66) * PAGE - 10, 0u64),
+            ((base + 62) * PAGE + 10, (base + 66) * PAGE - 10, 11u64),
+            ((base + 62) * PAGE + 10, (base + 66) * PAGE - 10, 25u64),
+            ((base + 126) * PAGE, (base + 130) * PAGE, 0u64),
+            (start, end, 0u64),
+            // Once fully initialized, verify clean and dirty fast paths.
+            (start, end, 0u64),
+            (start, end, 50u64),
+        ];
+
+        for (step, &(from, to, ranged)) in queries.iter().enumerate() {
+            let now = 30 + step as u64;
+            let expected = plan_stale_oracle(&mut oracle, base, start, end, from, to, now, ranged, &written);
+            let got = fast.plan_stale(base, start, end, from, to, now, ranged, &written);
+            assert_eq!(got, expected, "step {step} [{from:#x}..{to:#x}) ranged={ranged}");
+            assert_copied_invariants(&fast, &oracle);
+        }
+    }
+
+    #[test]
+    fn stale_pages_in_and_has_stale_in_match_dense_oracle() {
+        const PAGES: usize = 140;
+        let base = 0x200usize;
+        let mut oracle = vec![0u64; PAGES];
+        let mut fast = CopiedPages::new(PAGES);
+        for idx in (0..PAGES).filter(|i| i % 4 != 0) {
+            let seq = (idx as u64 % 6) + 1;
+            oracle[idx] = seq;
+            fast.set(idx, seq);
+        }
+        let written = [
+            (base - 3, 50),
+            (base + 1, 10),
+            (base + 63, 2),
+            (base + 64, 10),
+            (base + 127, 10),
+            (base + 128, 1),
+            (base + 139, 10),
+            (base + PAGES + 2, 50),
+        ];
+        let at = |p: usize| p * PAGE;
+        let ranges = [
+            (at(base), at(base)),
+            (at(base - 4), at(base)),
+            (at(base + PAGES), at(base + PAGES + 4)),
+            (at(base) + 17, at(base + 3) + 5),
+            (at(base + 62), at(base + 67)),
+            (at(base + 125), at(base + 131)),
+            (at(base - 2), at(base + PAGES + 3)),
+        ];
+        for &(a, e) in &ranges {
+            let expected = stale_pages_in(base, &oracle, a, e, &written);
+            assert_eq!(fast.stale_pages_in(base, a, e, &written), expected, "[{a:#x}..{e:#x})");
+            assert_eq!(fast.has_stale_in(base, a, e, &written), !expected.is_empty(), "[{a:#x}..{e:#x})");
+        }
+        // Mark all pages copied and re-verify fast path.
+        for idx in 0..PAGES {
+            oracle[idx] = 5;
+            fast.set(idx, 5);
+        }
+        for &(a, e) in &ranges {
+            let expected = stale_pages_in(base, &oracle, a, e, &written);
+            assert_eq!(fast.stale_pages_in(base, a, e, &written), expected, "all-copied [{a:#x}..{e:#x})");
+            assert_eq!(fast.has_stale_in(base, a, e, &written), !expected.is_empty(), "all-copied [{a:#x}..{e:#x})");
+        }
+    }
+
+    #[test]
+    fn word_runs_and_put_match_scalar_across_alignments_and_tails() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let lengths = [
+            0usize, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 31, 32, 33, 35, 36, 63, 64, 65, 252, 255, 256,
+            257, 259, 260, 287, 288, 289, 511, 512, 515, 4096, 4099,
+        ];
+        for at in [0x1000usize, 0x1001, 0x1002, 0x1003] {
+            for &len in &lengths {
+                let held_base: Vec<u8> = (0..len).map(|i| ((i * 19 + 5) & 0xff) as u8).collect();
+
+                // Check identical, all-differing, boundary-byte, and mixed sparse/dense patterns.
+                for pattern in 0..4 {
+                    let mut title = held_base.clone();
+                    match pattern {
+                        0 => {}
+                        1 => {
+                            for b in &mut title {
+                                *b ^= 0xFF;
+                            }
+                        }
+                        2 => {
+                            for &pos in &[0usize, 1, 2, 3, 4, 31, 32, 33, 255, 256, 257, len.saturating_sub(1)] {
+                                if pos < len {
+                                    title[pos] ^= 0x5A;
+                                }
+                            }
+                        }
+                        _ => {
+                            let edits = ((next() as usize) % 24).min(len);
+                            for _ in 0..edits {
+                                let pos = (next() as usize) % len;
+                                let span = [1usize, 2, 4, 12, 40][(next() as usize) % 5].min(len - pos);
+                                for b in &mut title[pos..pos + span] {
+                                    *b ^= 0x3C;
+                                }
+                            }
+                        }
+                    }
+
+                    let expected = dword_runs(at, &held_base, &title, 0);
+                    assert_eq!(
+                        word_runs(at, &title, &held_base),
+                        expected,
+                        "word_runs at={at:#x} len={len} pattern={pattern}"
+                    );
+
+                    let mut held_put = held_base.clone();
+                    assert_eq!(
+                        word_runs_put(at, &title, &mut held_put),
+                        expected,
+                        "word_runs_put at={at:#x} len={len} pattern={pattern}"
+                    );
+                    assert_eq!(held_put, title, "word_runs_put bytes at={at:#x} len={len} pattern={pattern}");
+
+                    let mut held_chunk = held_base.clone();
+                    assert_eq!(
+                        take_chunk(at, &title, &mut held_chunk, false),
+                        expected,
+                        "take_chunk(!whole) at={at:#x} len={len} pattern={pattern}"
+                    );
+                    assert_eq!(held_chunk, title);
+
+                    let mut held_whole = held_base.clone();
+                    let expected_whole = if len == 0 { Vec::new() } else { vec![(0, len)] };
+                    assert_eq!(take_chunk(at, &title, &mut held_whole, true), expected_whole);
+                    assert_eq!(held_whole, title);
+                }
+            }
+        }
+    }
 }
