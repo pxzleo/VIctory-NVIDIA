@@ -3553,6 +3553,19 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_readback_texture() -> This {
+    let heap = HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 };
+    let desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 256, height: 256, depth_or_array_size: 1,
+        mip_levels: 1, format: 41, sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+    };
+    let null = std::ptr::null();
+    let mut out = null;
+    assert_eq!(create_committed(null, &heap, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

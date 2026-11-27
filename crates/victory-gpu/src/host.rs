@@ -6679,10 +6679,16 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        let existing = deferred.back_wanted.iter_mut().find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                // Reuse or remapping invalidated the prior readback.
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
     }
 
@@ -10531,6 +10537,37 @@ mod refresh_tests {
         #[cfg(feature = "diagnostics")]
         println!("per frame, as `crate::watch::asks`: {:?}", crate::watch::asks().map(|n| n / FRAMES as u64));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_rewritten_texture_records_a_readback_after_memory_reuse() {
+    struct ResetKinds(Option<&'static [(u64, u32, u32)]>);
+    impl Drop for ResetKinds {
+        fn drop(&mut self) {
+            crate::texback::TEST_KINDS.set(self.0);
+        }
+    }
+    let _kinds = ResetKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
+    let Some(host) = host() else {
+        assert!(!crate::switch::on("VICTORY_D3D12_WARP"), "the requested D3D12 WARP device is unavailable");
+        eprintln!("skipping the texture readback test: no D3D12 device");
+        return;
+    };
+    let list = host.new_list().expect("open command list");
+    let texture = crate::resource::test_readback_texture();
+    let (_, at, _) = crate::resource::title_texture(texture).expect("title texture storage");
+
+    list.texture_written(texture);
+    assert_eq!(list.deferred().back_wanted.len(), 1);
+    crate::texback::replaced(at);
+    list.texture_written(texture);
+    list.texture_written(texture);
+    list.close();
+    assert_eq!(list.deferred().texture_backs.len(), 1, "record one readback for the new write");
+
+    let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(texture, 0x10);
+    assert_eq!(release(texture), 0);
 }
 
 #[cfg(test)]

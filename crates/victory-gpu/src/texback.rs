@@ -26,8 +26,18 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_KINDS: std::cell::Cell<Option<&'static [(u64, u32, u32)]>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The kinds copied back: (width, height, format).
 fn kinds() -> &'static [(u64, u32, u32)] {
+    #[cfg(test)]
+    if let Some(kinds) = TEST_KINDS.get() {
+        return kinds;
+    }
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
@@ -122,6 +132,11 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether this readback still belongs to the texture's current allocation.
+    pub(crate) fn fresh(&self) -> bool {
+        self.ticket.valid.load(Ordering::Acquire)
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -142,7 +157,7 @@ impl Back {
 
 /// Records a host copy from a texture already in COPY_SOURCE.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
-    if !target.ticket.valid.load(Ordering::Acquire) {
+    if !target.fresh() {
         return None;
     }
     let host = crate::host::host()?;
