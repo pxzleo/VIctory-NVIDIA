@@ -235,16 +235,17 @@ impl Worker {
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
+        let mapped: Vec<_> = jobs.iter().map(|job| {
             job.staging.refresh();
-        }
+            job.staging.mapped.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }).collect();
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
-            for job in jobs {
-                job.record(&self.list);
+            for (job, mapped) in jobs.iter().zip(&mapped) {
+                job.staging.record(&self.list, &job.copy.texture, mapped);
             }
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
@@ -252,33 +253,10 @@ impl Worker {
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
         }
-        Ok(())
-    }
-}
-
-impl Job {
-    /// # Safety
-    /// `list` is an open copy list, and the job lives until it has run.
-    unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
-        let (s, texture) = (&self.staging, &self.copy.texture);
-        for (i, footprint) in s.footprints.iter().enumerate() {
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: a borrowed pointer the location never releases.
-                pResource: unsafe { std::mem::transmute_copy(texture) },
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: s.first - s.level0 + i as u32 },
-            };
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
-                },
-            };
-            // SAFETY: the caller's.
-            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        for job in jobs {
+            job.copy.last_title_upload.store(job.staging.id, Relaxed);
         }
+        Ok(())
     }
 }
 
@@ -367,6 +345,7 @@ mod tests {
         let wait = std::time::Duration::from_secs(20);
         assert_eq!((heard.recv_timeout(wait), heard.recv_timeout(wait)), (Ok(1), Ok(2)));
         assert!(there(texture) && claim(texture, 0, u64::MAX).is_none());
+        assert_eq!(copy.last_title_upload.load(Relaxed), job.staging.id);
         // Level 0 as the card has it, and as the layout says.
         let layout = crate::resource::texture_memory(texture)
             .and_then(|(_, d)| crate::resource::texture_layout(&d).map(|t| t.planes[0].layout.clone()))

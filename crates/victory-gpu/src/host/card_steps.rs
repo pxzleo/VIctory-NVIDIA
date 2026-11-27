@@ -565,8 +565,8 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: to.is_some(),
                     title: *src,
                 },
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Step::Texture(upload) => {
+                    let (at, len) = upload.staging.memory();
                     Does::Read {
                         from: at,
                         to: at + len,

@@ -1177,6 +1177,8 @@ pub(crate) struct HostTexture {
     pub(crate) grown: std::sync::atomic::AtomicBool,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
+    /// The staging identity of the last scheduled title upload (0: none).
+    pub(crate) last_title_upload: std::sync::atomic::AtomicU64,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
@@ -2462,6 +2464,7 @@ impl HostTexture {
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
+            last_title_upload: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
         }
@@ -2487,6 +2490,7 @@ impl HostTexture {
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
+            last_title_upload: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
         }

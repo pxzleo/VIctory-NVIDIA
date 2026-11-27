@@ -121,8 +121,8 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
     runs.iter().any(|list| {
         list.deferred().copies.iter().any(|step| match step {
             &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
+            Step::Texture(upload) => {
+                let (at, len) = upload.staging.memory();
                 touches(&ranges, at, at + len)
             }
             Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
